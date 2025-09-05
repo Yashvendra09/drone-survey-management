@@ -1,0 +1,2761 @@
+﻿### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\AltitudeChart.jsx
+// AltitudeChart.jsx
+import React from 'react';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+
+export default function AltitudeChart({ history = [] }) {
+  // history: array of { t, pos: {lat,lng,alt} }
+  const data = history.map((h, i) => ({
+    time: new Date(h.t).toLocaleTimeString(),
+    alt: h.pos?.alt ?? (h.alt ?? 0)
+  }));
+
+  if (data.length === 0) return <div className="text-sm text-gray-500 p-2">No altitude data</div>;
+
+  return (
+    <div style={{ width: '100%', height: 160 }} className="bg-white p-2 rounded-lg shadow">
+      <ResponsiveContainer>
+        <LineChart data={data}>
+          <XAxis dataKey="time" hide />
+          <YAxis domain={['auto', 'auto']} />
+          <Tooltip />
+          <Line type="monotone" dataKey="alt" stroke="#2563eb" strokeWidth={2} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\AnimatedMarker.jsx
+// AnimatedMarker.jsx
+import { useEffect, useRef } from 'react';
+import { Marker, Popup, useMap } from 'react-leaflet';
+import L from 'leaflet';
+
+export default function AnimatedMarker({ id, position, children, duration = 600 }) {
+  const markerRef = useRef(null);
+  const lastPosRef = useRef(position);
+  const animRef = useRef(null);
+  const map = useMap();
+
+  useEffect(() => {
+    // ensure lastPosRef is initialized
+    if (!lastPosRef.current) lastPosRef.current = position;
+  }, []);
+
+  useEffect(() => {
+    if (!position) return;
+    const start = lastPosRef.current;
+    const end = position;
+    const startTs = performance.now();
+
+    const step = (now) => {
+      const t = Math.min(1, (now - startTs) / duration);
+      const lat = start.lat + (end.lat - start.lat) * t;
+      const lng = start.lng + (end.lng - start.lng) * t;
+
+      if (markerRef.current && markerRef.current.setLatLng) {
+        markerRef.current.setLatLng([lat, lng]);
+      }
+
+      if (t < 1) {
+        animRef.current = requestAnimationFrame(step);
+      } else {
+        lastPosRef.current = end;
+        animRef.current = null;
+      }
+    };
+
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    animRef.current = requestAnimationFrame(step);
+
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [position, duration]);
+
+  // when marker created, center it at position (avoid jump)
+  return (
+    <Marker
+      ref={markerRef}
+      position={[position.lat, position.lng]}
+      eventHandlers={{
+        add() {
+          // ensure map keeps marker in view if desired
+        }
+      }}
+      // shadowless small circle icon (optional)
+      icon={new L.DivIcon({
+        className: 'animated-marker',
+        html: `<div style="width:14px;height:14px;border-radius:50%;background:#ef4444;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,0.15)"></div>`
+      })}
+    >
+      {children && <Popup>{children}</Popup>}
+    </Marker>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\LiveMap.jsx
+// frontend/src/components/LiveMap.jsx
+import React, { useEffect, useMemo } from 'react';
+import {
+  MapContainer,
+  TileLayer,
+  Polyline,
+  Marker,
+  Popup,
+  CircleMarker,
+  Polygon,
+  LayersControl,
+  ScaleControl,
+  Tooltip,
+  useMap,
+} from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import AnimatedMarker from './AnimatedMarker';
+
+// Fix leaflet icons for Vite
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: new URL('leaflet/dist/images/marker-icon-2x.png', import.meta.url).href,
+  iconUrl: new URL('leaflet/dist/images/marker-icon.png', import.meta.url).href,
+  shadowUrl: new URL('leaflet/dist/images/marker-shadow.png', import.meta.url).href,
+});
+
+// Fit-to-bounds helper component
+function FitToData({ bounds, fitToMission }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!bounds || !bounds.isValid()) return;
+    map.fitBounds(bounds, { padding: [24, 24], maxZoom: 17, animate: true });
+  }, [bounds, map, fitToMission]);
+  return null;
+}
+
+// ensure polygon closed and coords are [lat,lng], robust filtering
+function normalizePoint(pt) {
+  if (!pt) return null;
+  if (Array.isArray(pt) && pt.length >= 2) {
+    const a = Number(pt[0]), b = Number(pt[1]);
+    if (!isFinite(a) || !isFinite(b)) return null;
+    // heuristic swap if likely [lng,lat]
+    if (Math.abs(a) > 90 && Math.abs(b) <= 90) return [b, a];
+    return [a, b];
+  }
+  if (typeof pt === 'object' && pt !== null && ('lat' in pt || 'lng' in pt)) {
+    const lat = Number(pt.lat ?? pt.latitude ?? pt[0]);
+    const lng = Number(pt.lng ?? pt.longitude ?? pt[1]);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    return [lat, lng];
+  }
+  return null;
+}
+
+function closePolygon(coords) {
+  if (!coords || coords.length < 3) return coords;
+  const first = coords[0], last = coords[coords.length - 1];
+  if (Math.abs(first[0] - last[0]) < 1e-9 && Math.abs(first[1] - last[1]) < 1e-9) {
+    return coords;
+  }
+  return [...coords, first];
+}
+
+export default function LiveMap({
+  missions = [],
+  livePositions = {},
+  center = [20, 0],
+  zoom = 2,
+  replayPos,
+  selectedMission = null, // pass the selected mission object (not just id)
+  showWaypointsForSelected = true,
+  areaOpacity = 0.28, // <-- new prop, sensible default
+}) {
+  // Areas
+  const areas = useMemo(() => {
+    return missions
+      .map((m) => {
+        const raw = m.areaCoordinates ?? m.area ?? m.areaCoords ?? m.polygon ?? [];
+        const coords = (Array.isArray(raw) ? raw : [])
+          .map(normalizePoint)
+          .filter(Boolean);
+        return { id: m._id ?? m.id ?? m.name, name: m.name, coords: closePolygon(coords) };
+      })
+      .filter((a) => a.coords && a.coords.length >= 3);
+  }, [missions]);
+
+  // Flight paths
+  const polylines = useMemo(() => {
+    return missions.map((m) => {
+      const raw = m.flightPath ?? m.flight_path ?? m.path ?? [];
+      const coords = (Array.isArray(raw) ? raw : [])
+        .map(normalizePoint)
+        .filter(Boolean);
+      return { id: m._id ?? m.id ?? m.name, name: m.name, coords };
+    });
+  }, [missions]);
+
+  // Waypoint dots (sparse)
+  const waypointDots = useMemo(() => {
+    return missions.map((m) => {
+      const fps = Array.isArray(m.flightPath ?? m.flight_path ?? m.path) ? (m.flightPath ?? m.flight_path ?? m.path) : [];
+      const step = Math.max(1, Math.floor(fps.length / 60));
+      const pts = fps
+        .map((wp, i) => ({ i, wp }))
+        .filter((p) => p.i % step === 0 || p.i === 0 || p.i === fps.length - 1);
+      return { id: m._id ?? m.id ?? m.name, pts };
+    });
+  }, [missions]);
+
+  // Build bounds from everything we can
+  const bounds = useMemo(() => {
+    const b = new L.LatLngBounds();
+    let any = false;
+    areas.forEach((a) => {
+      a.coords.forEach((c) => {
+        b.extend(c);
+        any = true;
+      });
+    });
+    polylines.forEach((p) => p.coords.forEach((c) => {
+      b.extend(c);
+      any = true;
+    }));
+    Object.values(livePositions).forEach((pos) => {
+      if (pos && Number.isFinite(Number(pos.lat)) && Number.isFinite(Number(pos.lng))) {
+        b.extend([Number(pos.lat), Number(pos.lng)]);
+        any = true;
+      }
+    });
+    if (replayPos && Number.isFinite(Number(replayPos.lat)) && Number.isFinite(Number(replayPos.lng))) {
+      b.extend([Number(replayPos.lat), Number(replayPos.lng)]);
+      any = true;
+    }
+    return any ? b : null;
+  }, [areas, polylines, livePositions, replayPos]);
+
+  const selectedId = selectedMission?._id ?? selectedMission?.id ?? null;
+
+  return (
+    <div className="w-full h-[70vh] rounded-lg overflow-hidden shadow">
+      <MapContainer center={center} zoom={zoom} style={{ height: '100%', width: '100%' }} zoomControl={true}>
+        <LayersControl position="topright">
+          <LayersControl.BaseLayer checked name="OpenStreetMap">
+            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap contributors" />
+          </LayersControl.BaseLayer>
+          <LayersControl.BaseLayer name="Esri Satellite">
+            <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" attribution="Tiles &copy; Esri" />
+          </LayersControl.BaseLayer>
+
+          <LayersControl.Overlay checked name="Survey Areas">
+            <>
+              {areas.map((a) => {
+                const isSel = selectedId && String(a.id) === String(selectedId);
+                // stronger non-selected opacity so it is visible on bright maps
+                const nonSelOpacity = Math.max(0.12, areaOpacity * 0.35);
+                return (
+                  <Polygon
+                    key={`area-${a.id}`}
+                    positions={a.coords}
+                    pathOptions={{
+                      color: isSel ? '#059669' : '#64748b',
+                      weight: isSel ? 2.5 : 1.5,
+                      // explicit fill flag and slightly stronger colors
+                      fill: true,
+                      fillColor: isSel ? '#10b981' : '#94a3b8',
+                      fillOpacity: isSel ? areaOpacity : nonSelOpacity,
+                      dashArray: isSel ? null : '6 6',
+                    }}
+                  >
+                    <Tooltip direction="center" permanent opacity={0.9} className="!bg-transparent !border-0">
+                      <span className="text-xs font-medium">{a.name || `Mission ${a.id}`}</span>
+                    </Tooltip>
+                  </Polygon>
+                );
+              })}
+            </>
+          </LayersControl.Overlay>
+
+          <LayersControl.Overlay checked name="Flight Paths">
+            <>
+              {polylines.map((p) =>
+                p.coords.length > 1 ? (
+                  <Polyline
+                    key={`line-${p.id}`}
+                    positions={p.coords}
+                    pathOptions={{
+                      color: selectedId && String(p.id) === String(selectedId) ? '#2563eb' : '#9ca3af',
+                      weight: selectedId && String(p.id) === String(selectedId) ? 3 : 2,
+                      opacity: selectedId && String(p.id) === String(selectedId) ? 1 : 0.8,
+                      dashArray: selectedId && String(p.id) === String(selectedId) ? null : '4 6',
+                    }}
+                  />
+                ) : null
+              )}
+            </>
+          </LayersControl.Overlay>
+
+          <LayersControl.Overlay name="Waypoint Dots">
+            <>
+              {showWaypointsForSelected && selectedId && (() => {
+                const sel = missions.find(m => String(m._id ?? m.id) === String(selectedId));
+                if (!sel) return null;
+                const fps = sel.flightPath ?? sel.flight_path ?? sel.path ?? [];
+                return fps.map((wp, i) => {
+                  const p = normalizePoint(wp);
+                  if (!p) return null;
+                  return (
+                    <CircleMarker key={`wp-${selectedId}-${i}`} center={p} radius={4} pathOptions={{ color: '#2563eb', fillColor: '#2563eb' }}>
+                      <Tooltip direction="top" offset={[0, -6]}>
+                        <div className="text-[10px]">
+                          WP {i + 1} <br /> alt {Number(wp.alt ?? wp.altitude ?? wp[2] ?? 0)}m
+                        </div>
+                      </Tooltip>
+                    </CircleMarker>
+                  );
+                });
+              })()}
+            </>
+          </LayersControl.Overlay>
+        </LayersControl>
+
+        {/* Start markers */}
+        {polylines.map((p) => {
+          if (!p.coords || p.coords.length === 0) return null;
+          const start = p.coords[0];
+          return (
+            <Marker key={`start-${p.id}`} position={start}>
+              <Popup>
+                <div className="text-sm font-semibold">{p.name || `Mission ${p.id}`}</div>
+                <div className="text-xs">Start point</div>
+              </Popup>
+            </Marker>
+          );
+        })}
+
+        {/* Animated live markers */}
+        {Object.entries(livePositions).map(([missionId, pos]) => {
+          if (!pos) return null;
+          const n = normalizePoint(pos);
+          if (!n) return null;
+          const payload = { lat: Number(n[0]), lng: Number(n[1]) };
+          return (
+            <AnimatedMarker key={`live-${missionId}`} id={missionId} position={payload}>
+              <div>
+                <div className="font-medium truncate max-w-[160px]">Mission {missionId}</div>
+                <div className="text-xs">Lat: {Number(payload.lat).toFixed(5)} | Lng: {Number(payload.lng).toFixed(5)}</div>
+                {Number.isFinite(Number(pos.alt)) && <div className="text-xs">Alt: {Math.round(pos.alt)} m</div>}
+              </div>
+            </AnimatedMarker>
+          );
+        })}
+
+        {/* Replay marker */}
+        {replayPos && Number.isFinite(Number(replayPos.lat)) && Number.isFinite(Number(replayPos.lng)) && (
+          <CircleMarker center={[Number(replayPos.lat), Number(replayPos.lng)]} radius={8} pathOptions={{ color: '#10b981', fillColor: '#10b981', fillOpacity: 0.9 }}>
+            <Popup>
+              <div className="text-xs">Replay</div>
+            </Popup>
+          </CircleMarker>
+        )}
+
+        <ScaleControl position="bottomleft" />
+        <FitToData bounds={bounds} fitToMission={selectedMission} />
+      </MapContainer>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\NavBar.jsx
+import { Link, useLocation } from 'react-router-dom'
+import clsx from 'clsx'
+
+export default function NavBar() {
+  const { pathname } = useLocation()
+  const item = (to, label) => (
+    <Link
+      to={to}
+      className={clsx(
+        'px-3 py-2 rounded-lg text-sm font-medium',
+        pathname === to
+          ? 'bg-blue-600 text-white'
+          : 'text-gray-700 hover:bg-gray-200'
+      )}
+    >
+      {label}
+    </Link>
+  )
+
+  return (
+    <div className="w-full border-b bg-white">
+      <div className="max-w-6xl mx-auto flex items-center gap-2 p-3">
+        <div className="font-bold text-lg mr-4">Drone Survey Console</div>
+        {item('/', 'Dashboard')}
+        {item('/drones', 'Drones')}
+        {item('/missions', 'Missions')}
+        {item('/monitor', 'Monitor')}
+        {item('/reports', 'Reports')}
+        {item('/planner','Planner')}
+      </div>
+    </div>
+  )
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\PolygonDrawer.jsx
+// frontend/src/components/PolygonDrawer.jsx
+import React, { useEffect, useState } from 'react';
+import { MapContainer, TileLayer, Marker, Polygon, Polyline, useMapEvents } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+
+// simple small marker icon to be consistent
+const smallIcon = new L.DivIcon({
+  className: 'drawer-marker',
+  html: `<div style="width:10px;height:10px;border-radius:50%;background:#2563eb;border:2px solid white"></div>`
+});
+
+/**
+ * Map click handler component
+ */
+function ClickHandler({ onMapClick, drawing }) {
+  useMapEvents({
+    click(e) {
+      if (drawing) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    },
+  });
+  return null;
+}
+
+/**
+ * Props:
+ *  - initialCenter [lat, lng]
+ *  - initialZoom
+ *  - onPolygonComplete(polygonLatLngs) called when user finishes polygon
+ */
+export default function PolygonDrawer({
+  initialCenter = [20, 0],
+  initialZoom = 4,
+  onPolygonComplete = () => {},
+}) {
+  const [drawing, setDrawing] = useState(true);
+  const [points, setPoints] = useState([]);
+
+  useEffect(() => {
+    // reset when drawing toggles off? no-op
+  }, [drawing]);
+
+  const handleMapClick = (latlng) => {
+    setPoints((p) => [...p, latlng]);
+  };
+
+  const undo = () => {
+    setPoints((p) => p.slice(0, -1));
+  };
+
+  const clear = () => {
+    setPoints([]);
+  };
+
+  const finish = () => {
+    if (points.length < 3) {
+      alert('Draw at least 3 points to form a polygon.');
+      return;
+    }
+    setDrawing(false);
+    onPolygonComplete(points);
+  };
+
+  return (
+    <div>
+      <div className="mb-2 flex gap-2">
+        <button onClick={() => setDrawing(true)} className="px-3 py-1 rounded bg-blue-600 text-white text-sm">Draw</button>
+        <button onClick={undo} className="px-3 py-1 rounded bg-gray-100 text-sm">Undo</button>
+        <button onClick={clear} className="px-3 py-1 rounded bg-gray-100 text-sm">Clear</button>
+        <button onClick={finish} className="px-3 py-1 rounded bg-green-600 text-white text-sm">Finish Polygon</button>
+        <div className="text-sm text-gray-500 ml-auto">{points.length} points</div>
+      </div>
+
+      <div className="w-full h-96 rounded overflow-hidden shadow-sm">
+        <MapContainer center={initialCenter} zoom={initialZoom} style={{ height: '100%', width: '100%' }}>
+          <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="&copy; OpenStreetMap" />
+          <ClickHandler onMapClick={handleMapClick} drawing={drawing} />
+          {points.length > 0 && (
+            <>
+              {points.map((pt, i) => (
+                <Marker key={i} position={[pt[0], pt[1]]} icon={smallIcon} />
+              ))}
+              <Polyline positions={points.map((p) => [p[0], p[1]])} />
+            </>
+          )}
+          {points.length >= 3 && (
+            <Polygon positions={points.map((p) => [p[0], p[1]])} pathOptions={{ color: '#10b981', fillOpacity: 0.08 }} />
+          )}
+        </MapContainer>
+      </div>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\StatCard.jsx
+export default function StatCard({ title, value, subtitle }) {
+    return (
+      <div className="bg-white rounded-2xl shadow p-5">
+        <div className="text-gray-500 text-sm">{title}</div>
+        <div className="text-3xl font-semibold mt-1">{value}</div>
+        {subtitle && <div className="text-gray-400 text-xs mt-2">{subtitle}</div>}
+      </div>
+    )
+  }
+  
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\TelemetryCard.jsx
+// frontend/src/components/TelemetryCard.jsx
+import React from 'react';
+
+export default function TelemetryCard({ telemetry = {}, drone = {} }) {
+  const battery = telemetry.battery ?? drone?.batteryLevel;
+  const alt = telemetry.alt;
+  const speed = telemetry.speed;
+  const lastSeen = telemetry.lastSeen;
+
+  const fmt = (v, suffix = '') =>
+    (v === 0 || (v !== null && v !== undefined))
+      ? `${Math.round(v)}${suffix}`
+      : '-';
+
+  return (
+    <div className="bg-white rounded-lg shadow p-3 text-sm space-y-1">
+      <div className="font-medium">Telemetry</div>
+      <div className="grid grid-cols-2 gap-2">
+        <div className="text-gray-500">Battery</div>
+        <div className="text-right">
+          {battery !== null && battery !== undefined ? `${Math.round(battery)}%` : '-'}
+        </div>
+
+        <div className="text-gray-500">Altitude</div>
+        <div className="text-right">{fmt(alt, ' m')}</div>
+
+        <div className="text-gray-500">Speed</div>
+        <div className="text-right">{fmt(speed, ' m/s')}</div>
+
+        <div className="text-gray-500">Last seen</div>
+        <div className="text-right">
+          {lastSeen ? new Date(lastSeen).toLocaleTimeString() : '-'}
+        </div>
+      </div>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\components\TimelineControl.jsx
+// TimelineControl.jsx
+import React, { useEffect, useMemo, useState, useRef } from 'react';
+
+export default function TimelineControl({ history = [], onSeek = () => {}, initialSpeed = 1 }) {
+  const [index, setIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(initialSpeed);
+  const rafRef = useRef(null);
+  const lastTsRef = useRef(null);
+
+  // clamp
+  const maxIndex = Math.max(0, history.length - 1);
+
+  useEffect(() => {
+    // reset index when history changes
+    setIndex(history.length ? history.length - 1 : 0);
+  }, [history.length]);
+
+  useEffect(() => {
+    onSeek(history[index]);
+  }, [index, history, onSeek]);
+
+  useEffect(() => {
+    if (!playing) {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      return;
+    }
+
+    let prev = performance.now();
+    const step = () => {
+      const now = performance.now();
+      const dt = (now - prev) / 1000; // seconds
+      prev = now;
+
+      // advance index based on speed (speed = x realtime speed)
+      // Compute fraction: we move one index per (1/speed) * base seconds (approx)
+      // Use a simple accumulator approach:
+      lastTsRef.current = (lastTsRef.current || 0) + dt * speed;
+      const incrementEvery = 0.5; // seconds per history step at speed=1
+      const steps = Math.floor(lastTsRef.current / incrementEvery);
+      if (steps > 0) {
+        lastTsRef.current -= steps * incrementEvery;
+        setIndex((i) => Math.min(maxIndex, i + steps));
+      }
+
+      rafRef.current = requestAnimationFrame(step);
+    };
+
+    rafRef.current = requestAnimationFrame(step);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [playing, speed, maxIndex]);
+
+  const handleSeek = (e) => {
+    const v = Number(e.target.value);
+    setIndex(v);
+    setPlaying(false);
+  };
+
+  return (
+    <div className="p-3 border rounded-lg bg-white flex items-center gap-3">
+      <button
+        onClick={() => setPlaying(p => !p)}
+        className="px-3 py-1 rounded bg-blue-600 text-white text-xs"
+      >{playing ? 'Pause' : 'Play'}</button>
+
+      <input
+        type="range"
+        min={0}
+        max={maxIndex}
+        value={index}
+        onChange={handleSeek}
+        className="flex-1"
+      />
+
+      <div className="flex items-center gap-2 text-xs">
+        <div>Speed</div>
+        <select value={speed} onChange={(e)=>setSpeed(Number(e.target.value))} className="text-sm border px-2 py-1 rounded">
+          <option value={0.5}>0.5x</option>
+          <option value={1}>1x</option>
+          <option value={2}>2x</option>
+          <option value={4}>4x</option>
+        </select>
+      </div>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\context\useAppStore.js
+import { create } from 'zustand'
+import { fetchDrones, fetchMissions } from '../services/api'
+
+export const useAppStore = create((set, get) => ({
+  loading: false,
+  drones: [],
+  missions: [],
+  stats: { totalDrones: 0, inMission: 0, available: 0, completedMissions: 0 },
+
+  loadInitial: async () => {
+    set({ loading: true })
+    try {
+      const [drones, missions] = await Promise.all([fetchDrones(), fetchMissions()])
+      set({ drones, missions })
+      get().computeStats()
+    } catch (e) {
+      console.error('Failed to load data', e)
+    } finally {
+      set({ loading: false })
+    }
+  },
+
+  computeStats: () => {
+    const { drones, missions } = get()
+    const totalDrones = drones.length
+    const inMission = drones.filter(d => d.status === 'in-mission' || d.status === 'in-progress').length
+    const available = drones.filter(d => d.status === 'available').length
+    const completedMissions = missions.filter(m => m.status === 'completed').length
+    set({ stats: { totalDrones, inMission, available, completedMissions } })
+  }
+}))
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\hooks\useSocket.js
+// frontend/src/hooks/useSocket.js
+import { useEffect } from 'react';
+import { socket } from '../services/socket';
+
+export function useSocket(event, handler) {
+  useEffect(() => {
+    if (!event || !handler) return;
+    socket.on(event, handler);
+    return () => {
+      socket.off(event, handler);
+    };
+  }, [event, handler]);
+}
+
+export default socket;
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\Dashboard.jsx
+// frontend/src/pages/Dashboard.jsx
+import React, { useEffect, useState, useMemo } from 'react';
+import { Link } from 'react-router-dom';
+import { fetchDrones, fetchMissions, startMission } from '../services/api';
+import StatCard from '../components/StatCard';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, BarChart, Bar } from 'recharts';
+import { formatDistanceToNowStrict } from 'date-fns';
+import clsx from 'clsx';
+
+const STATUS_COLORS = {
+  available: '#10b981',
+  'in-progress': '#2563eb',
+  scheduled: '#f59e0b',
+  completed: '#6b7280',
+  aborted: '#ef4444',
+  offline: '#9ca3af'
+};
+
+const PATTERN_LABEL = {
+  grid: 'Lawnmower',
+  lawnmower: 'Lawnmower',
+  crosshatch: 'Crosshatch',
+  perimeter: 'Perimeter',
+};
+
+export default function Dashboard() {
+  const [drones, setDrones] = useState([]);
+  const [missions, setMissions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [startingId, setStartingId] = useState(null);
+
+  useEffect(() => {
+    loadAll();
+  }, []);
+
+  const loadAll = async () => {
+    setLoading(true);
+    try {
+      const [d, m] = await Promise.all([fetchDrones(), fetchMissions()]);
+      setDrones(Array.isArray(d) ? d : []);
+      setMissions(Array.isArray(m) ? m : []);
+    } catch (err) {
+      console.error('Failed to load dashboard data', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // KPI values
+  const stats = useMemo(() => {
+    const totalDrones = drones.length;
+    const inMission = drones.filter((x) => x.status === 'in-mission' || x.status === 'in-progress').length;
+    const available = drones.filter((x) => x.status === 'available').length;
+    const completed = missions.filter((m) => m.status === 'completed').length;
+    return { totalDrones, inMission, available, completed };
+  }, [drones, missions]);
+
+  // pie data for drone statuses
+  const droneStatusCounts = useMemo(() => {
+    const counts = {};
+    drones.forEach((d) => {
+      const s = d.status || 'offline';
+      counts[s] = (counts[s] || 0) + 1;
+    });
+    return Object.entries(counts).map(([status, value]) => ({ name: status, value, color: STATUS_COLORS[status] || '#64748b' }));
+  }, [drones]);
+
+  // mission status distribution
+  const missionStatusCounts = useMemo(() => {
+    const counts = {};
+    missions.forEach((m) => {
+      const s = m.status || 'scheduled';
+      counts[s] = (counts[s] || 0) + 1;
+    });
+    return Object.entries(counts).map(([name, value]) => ({ name, value }));
+  }, [missions]);
+
+  // recent missions
+  const recentMissions = useMemo(() => {
+    return [...missions].sort((a, b) => {
+      const ta = new Date(a.updatedAt || a.createdAt || Date.now()).getTime();
+      const tb = new Date(b.updatedAt || b.createdAt || Date.now()).getTime();
+      return tb - ta;
+    }).slice(0, 6);
+  }, [missions]);
+
+  const handleStartFirstScheduled = async () => {
+    // find first mission with status 'planned'
+    const candidate = missions.find((m) => m.status === 'planned');
+    if (!candidate) {
+      alert('No scheduled mission found to start.');
+      return;
+    }
+    try {
+      setStartingId(candidate._id);
+      await startMission(candidate._id);
+      await loadAll();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to start mission: ' + (err?.response?.data?.message || err.message));
+    } finally {
+      setStartingId(null);
+    }
+  };
+
+  const patternText = (m) => {
+    const key = m.pattern ?? m.parameters?.pattern;
+    return PATTERN_LABEL[key] ?? (key || 'Lawnmower');
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6">
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-semibold">Overview</h1>
+          <div className="text-sm text-gray-500">Fleet & mission health at a glance</div>
+        </div>
+        <div className="flex items-center gap-3">
+          <Link to="/planner" className="px-4 py-2 bg-blue-600 text-white rounded-md text-sm">Create Mission</Link>
+          <button
+            onClick={handleStartFirstScheduled}
+            disabled={startingId !== null}
+            className={clsx('px-4 py-2 rounded-md text-sm', startingId ? 'bg-gray-200 text-gray-700' : 'bg-green-600 text-white')}
+          >
+            {startingId ? 'Startingâ€¦' : 'Start Next Mission'}
+          </button>
+          <button onClick={loadAll} className="px-3 py-2 border rounded-md text-sm">Refresh</button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <StatCard title="Total Drones" value={stats.totalDrones} subtitle="Registered drones" />
+        <StatCard title="In Mission" value={stats.inMission} subtitle="Active missions now" />
+        <StatCard title="Available" value={stats.available} subtitle="Ready for assignment" />
+        <StatCard title="Completed Missions" value={stats.completed} subtitle="All-time completed" />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <div className="lg:col-span-2 bg-white rounded-2xl shadow p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-medium">Mission Statuses</h2>
+            <div className="text-sm text-gray-500">Realtime & historical</div>
+          </div>
+
+          <div style={{ height: 240 }} className="mt-4">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={missionStatusCounts}>
+                <XAxis dataKey="name" />
+                <YAxis />
+                <Tooltip />
+                <Bar dataKey="value" fill="#2563eb" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="mt-4 text-sm text-gray-500">Recent missions</div>
+          <div className="mt-3 space-y-2">
+            {recentMissions.length === 0 && <div className="text-sm text-gray-500">No missions yet</div>}
+            {recentMissions.map((m) => (
+              <div key={m._id} className="flex items-center justify-between px-3 py-2 rounded hover:bg-gray-50">
+                <div>
+                  <div className="text-sm font-medium">{m.name || `Mission ${m._id.substring(0,6)}`}</div>
+                  <div className="text-xs text-gray-400">{m.flightPath?.length ?? 0} waypoints â€¢ {patternText(m)}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-sm font-medium">{m.progress ?? 0}%</div>
+                  <div className="text-xs text-gray-400">{m.status}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow p-4">
+          <h2 className="font-medium">Fleet Status</h2>
+          <div style={{ height: 240 }} className="mt-4">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={droneStatusCounts} dataKey="value" nameKey="name" innerRadius={40} outerRadius={80} label>
+                  {droneStatusCounts.map((entry, idx) => (
+                    <Cell key={idx} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Legend />
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-3 text-sm">
+            {droneStatusCounts.map((d) => (
+              <div key={d.name} className="flex items-center justify-between text-xs py-1">
+                <div className="flex items-center gap-2">
+                  <span style={{ width: 10, height: 10, background: d.color }} className="rounded" />
+                  <div className="capitalize">{d.name}</div>
+                </div>
+                <div className="text-gray-500">{d.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Missions table & rest omitted for brevity â€” keep unchanged */}
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\Drones.jsx
+// frontend/src/pages/Drones.jsx
+import React, { useEffect, useMemo, useState } from 'react';
+import { fetchDrones, addDrone, deleteDrone, updateDrone } from '../services/api';
+import { formatDistanceToNow } from 'date-fns';
+import clsx from 'clsx';
+import { useNavigate } from 'react-router-dom';
+
+function downloadCSV(filename, rows) {
+  const header = Object.keys(rows[0] || {}).join(',');
+  const csv = [header, ...rows.map(r => Object.values(r).map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+export default function Drones() {
+  const [drones, setDrones] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [q, setQ] = useState('');
+  const [selected, setSelected] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [newDrone, setNewDrone] = useState({
+    name: '',
+    model: '',
+    batteryLevel: 100,
+    status: 'available',
+    location: { lat: 0, lng: 0 }
+  });
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const data = await fetchDrones();
+      setDrones(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleAddDrone(e) {
+    e.preventDefault();
+    try {
+      await addDrone(newDrone);
+      setAdding(false);
+      setNewDrone({ name: '', model: '', batteryLevel: 100, status: 'available', location: { lat: 0, lng: 0 } });
+      await load();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to add drone');
+    }
+  }
+
+  async function handleDeleteDrone(id) {
+    if (!window.confirm('Are you sure you want to delete this drone?')) return;
+    try {
+      await deleteDrone(id);
+      setSelected(null);
+      await load();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to delete drone');
+    }
+  }
+
+  async function handleHealthCheck(id) {
+    try {
+      await updateDrone(id, { status: 'available', batteryLevel: 100 });
+      alert('Drone health check completed');
+      await load();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to run health check');
+    }
+  }
+
+  function handleAssignMission(drone) {
+    navigate(`/planner?drone=${drone._id}`);
+  }
+
+  const filtered = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return drones;
+    return drones.filter(d => [d.name, d.model, d._id, d.status].some(v => v && v.toString().toLowerCase().includes(s)));
+  }, [drones, q]);
+
+  const exportCSV = () => {
+    if (!drones.length) return alert('No drones to export');
+    const rows = drones.map(d => ({
+      id: d._id,
+      name: d.name || '',
+      model: d.model || '',
+      status: d.status || '',
+      battery: d.batteryLevel != null ? `${d.batteryLevel}%` : '',
+      lastSeen: d.updatedAt ? new Date(d.updatedAt).toISOString() : ''
+    }));
+    downloadCSV('drones.csv', rows);
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h1 className="text-2xl font-semibold">Fleet</h1>
+          <div className="text-sm text-gray-500">Manage drone inventory & health</div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search drones..." className="border rounded px-3 py-2 text-sm" />
+          <button onClick={load} className="px-3 py-2 border rounded text-sm">Refresh</button>
+          <button onClick={exportCSV} className="px-3 py-2 bg-blue-600 text-white rounded text-sm">Export CSV</button>
+          <button onClick={() => setAdding(true)} className="px-3 py-2 bg-green-600 text-white rounded text-sm">+ Add Drone</button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow overflow-hidden">
+        <table className="min-w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="text-left px-4 py-2">Name</th>
+              <th className="text-left px-4 py-2">Model</th>
+              <th className="text-left px-4 py-2">Status</th>
+              <th className="text-left px-4 py-2">Battery</th>
+              <th className="text-left px-4 py-2">Last Seen</th>
+              <th className="text-left px-4 py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && <tr><td colSpan={6} className="px-4 py-6 text-gray-500">Loadingâ€¦</td></tr>}
+            {!loading && filtered.length === 0 && <tr><td colSpan={6} className="px-4 py-6 text-gray-500">No drones</td></tr>}
+            {filtered.map(d => (
+              <tr key={d._id} className="border-t hover:bg-gray-50">
+                <td className="px-4 py-3">
+                  <div className="font-medium">{d.name || `Drone ${d._id.substring(0,6)}`}</div>
+                  <div className="text-xs text-gray-400">{d._id}</div>
+                </td>
+                <td className="px-4 py-3">{d.model || 'â€”'}</td>
+                <td className="px-4 py-3">
+                  <span className={clsx('px-2 py-1 rounded-md text-xs',
+                    d.status === 'available' ? 'bg-green-100 text-green-700'
+                      : d.status === 'in-mission' ? 'bg-blue-100 text-blue-700'
+                      : d.status === 'charging' ? 'bg-yellow-100 text-yellow-700'
+                      : 'bg-gray-100 text-gray-700'
+                  )}>
+                    {d.status || 'unknown'}
+                  </span>
+                </td>
+                <td className="px-4 py-3">{d.batteryLevel != null ? `${d.batteryLevel}%` : 'â€”'}</td>
+                <td className="px-4 py-3 text-xs text-gray-500">{d.updatedAt ? formatDistanceToNow(new Date(d.updatedAt), { addSuffix: true }) : 'â€”'}</td>
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => setSelected(d)} className="px-2 py-1 border rounded text-xs">View</button>
+                    <button onClick={() => handleAssignMission(d)} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">Assign</button>
+                    <button onClick={() => handleHealthCheck(d._id)} className="px-2 py-1 bg-yellow-400 rounded text-xs">Health</button>
+                    <button onClick={() => handleDeleteDrone(d._id)} className="px-2 py-1 bg-red-500 text-white rounded text-xs">Delete</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Drone detail drawer */}
+      {selected && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="flex-1" onClick={() => setSelected(null)} />
+          <div className="w-[500px] bg-white shadow-xl p-4 overflow-auto">
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-lg font-semibold">{selected.name || 'Drone'}</h3>
+                <div className="text-xs text-gray-500">{selected._id}</div>
+              </div>
+              <button onClick={() => setSelected(null)} className="px-2 py-1 text-gray-500">Close</button>
+            </div>
+
+            <div className="mt-4 space-y-3 text-sm text-gray-700">
+              <div><strong>Model:</strong> {selected.model || 'â€”'}</div>
+              <div><strong>Status:</strong> {selected.status || 'â€”'}</div>
+              <div><strong>Battery:</strong> {selected.batteryLevel != null ? `${selected.batteryLevel}%` : 'â€”'}</div>
+              <div><strong>Last Seen:</strong> {selected.updatedAt ? new Date(selected.updatedAt).toLocaleString() : 'â€”'}</div>
+              <div><strong>Notes:</strong> {selected.notes || 'No additional details'}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Drone Drawer */}
+      {adding && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="flex-1" onClick={() => setAdding(false)} />
+          <div className="w-[500px] bg-white shadow-xl p-4 overflow-auto">
+            <h3 className="text-lg font-semibold mb-4">Add Drone</h3>
+            <form onSubmit={handleAddDrone} className="space-y-4 text-sm">
+              <div>
+                <label className="text-gray-600">Name</label>
+                <input value={newDrone.name} onChange={e => setNewDrone({ ...newDrone, name: e.target.value })} className="w-full border rounded px-2 py-2 mt-1" required />
+              </div>
+              <div>
+                <label className="text-gray-600">Model</label>
+                <input value={newDrone.model} onChange={e => setNewDrone({ ...newDrone, model: e.target.value })} className="w-full border rounded px-2 py-2 mt-1" required />
+              </div>
+              <div>
+                <label className="text-gray-600">Battery Level (%)</label>
+                <input type="number" value={newDrone.batteryLevel} onChange={e => setNewDrone({ ...newDrone, batteryLevel: Number(e.target.value) })} min="0" max="100" className="w-full border rounded px-2 py-2 mt-1" />
+              </div>
+              <div>
+                <label className="text-gray-600">Status</label>
+                <select value={newDrone.status} onChange={e => setNewDrone({ ...newDrone, status: e.target.value })} className="w-full border rounded px-2 py-2 mt-1">
+                  <option value="available">Available</option>
+                  <option value="in-mission">In-Mission</option>
+                  <option value="charging">Charging</option>
+                  <option value="maintenance">Maintenance</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-gray-600">Latitude</label>
+                  <input type="number" value={newDrone.location.lat} onChange={e => setNewDrone({ ...newDrone, location: { ...newDrone.location, lat: Number(e.target.value) } })} className="w-full border rounded px-2 py-2 mt-1" />
+                </div>
+                <div>
+                  <label className="text-gray-600">Longitude</label>
+                  <input type="number" value={newDrone.location.lng} onChange={e => setNewDrone({ ...newDrone, location: { ...newDrone.location, lng: Number(e.target.value) } })} className="w-full border rounded px-2 py-2 mt-1" />
+                </div>
+              </div>
+              <div>
+                <button type="submit" className="w-full px-3 py-2 bg-green-600 text-white rounded">Add Drone</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\MissionPlanner.jsx
+// frontend/src/pages/MissionPlanner.jsx
+import React, { useState, useMemo, useEffect } from 'react';
+import PolygonDrawer from '../components/PolygonDrawer';
+import { generatePerimeter, generateLawnmower } from '../utils/waypointGenerator';
+import { fetchDrones, createMission } from '../services/api';
+import { useNavigate } from 'react-router-dom';
+import LiveMap from '../components/LiveMap';
+
+const PATTERN_LABEL = {
+  grid: 'Lawnmower',
+  crosshatch: 'Crosshatch',
+  perimeter: 'Perimeter',
+  lawnmower: 'Lawnmower',
+};
+
+export default function MissionPlanner() {
+  const [polygon, setPolygon] = useState(null); // [[lat,lng], ...]
+  const [name, setName] = useState('');
+  // NOTE: store canonical values here (grid/perimeter/crosshatch)
+  const [pattern, setPattern] = useState('grid');
+  const [altitude, setAltitude] = useState(40);
+  const [overlap, setOverlap] = useState(20);
+  const [swathWidth, setSwathWidth] = useState(60);
+  const [generatedPath, setGeneratedPath] = useState([]); // waypoints {lat,lng,alt,order}
+  const [previewOnMap, setPreviewOnMap] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const [drones, setDrones] = useState([]);
+  const [selectedDrone, setSelectedDrone] = useState('');
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    async function loadDrones() {
+      try {
+        const data = await fetchDrones();
+        setDrones(Array.isArray(data) ? data : []);
+        if (Array.isArray(data) && data.length === 1) {
+          setSelectedDrone(data[0]._id);
+        }
+      } catch (err) {
+        console.error('Failed to load drones', err);
+      }
+    }
+    loadDrones();
+  }, []);
+
+  // -----------------------
+  // Helpers
+  // -----------------------
+  function downsampleWaypoints(waypoints, maxPoints = 800) {
+    if (!Array.isArray(waypoints) || waypoints.length <= maxPoints) return waypoints;
+    const n = waypoints.length;
+    const step = (n - 1) / (maxPoints - 1);
+    const out = [];
+    for (let i = 0; i < maxPoints; i++) {
+      const idx = Math.round(i * step);
+      out.push(waypoints[Math.min(idx, n - 1)]);
+    }
+    return out;
+  }
+
+  function normalizeGeneratorOutput(rawPath, defaultAlt) {
+    if (!Array.isArray(rawPath)) return [];
+    return rawPath
+      .map((p, idx) => {
+        if (!p) return null;
+        if (Array.isArray(p)) {
+          const a = Number(p[0]), b = Number(p[1]), c = p.length > 2 ? Number(p[2]) : defaultAlt;
+          if (Number.isFinite(a) && Number.isFinite(b)) {
+            return { lat: a, lng: b, alt: Number.isFinite(c) ? c : defaultAlt, order: idx };
+          }
+          // try swapped
+          if (Number.isFinite(Number(p[1])) && Number.isFinite(Number(p[0]))) {
+            return { lat: Number(p[1]), lng: Number(p[0]), alt: Number.isFinite(Number(c)) ? c : defaultAlt, order: idx };
+          }
+        }
+        if (typeof p === 'object') {
+          const lat = Number(p.lat ?? p.latitude ?? p[0] ?? p[1]);
+          const lng = Number(p.lng ?? p.longitude ?? p[1] ?? p[0]);
+          const alt = Number(p.alt ?? p.altitude ?? defaultAlt);
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            return { lat, lng, alt: Number.isFinite(alt) ? alt : defaultAlt, order: idx };
+          }
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  // -----------------------
+  // Generation
+  // -----------------------
+  const generate = () => {
+    if (!polygon || polygon.length < 3) {
+      alert('Draw polygon first.');
+      return;
+    }
+
+    const effSpacing = Math.max(5, swathWidth * (1 - (Number(overlap) || 0) / 100));
+
+    const polyAsArrays = (polygon || []).map((pt) =>
+      Array.isArray(pt) ? [Number(pt[0]), Number(pt[1])] : [Number(pt.lat ?? pt[0]), Number(pt.lng ?? pt[1])]
+    );
+
+    if (!polyAsArrays.every(p => Number.isFinite(p[0]) && Number.isFinite(p[1]))) {
+      console.error('polygon points invalid', polygon, polyAsArrays);
+      alert('Polygon contains invalid coordinates. Re-draw polygon.');
+      return;
+    }
+
+    let rawPath = [];
+    try {
+      if (pattern === 'perimeter') {
+        rawPath = generatePerimeter(polyAsArrays, altitude);
+      } else {
+        // For grid/lawnmower and crosshatch pattern, we use generateLawnmower for now
+        rawPath = generateLawnmower(polyAsArrays, effSpacing, altitude);
+      }
+    } catch (err) {
+      console.error('Generator threw error:', err);
+      rawPath = [];
+    }
+
+    // fallback: try swapped lat/lng if empty
+    if ((!rawPath || rawPath.length === 0) && polyAsArrays.length) {
+      const swapped = polyAsArrays.map(p => [p[1], p[0]]);
+      try {
+        if (pattern === 'perimeter') {
+          rawPath = generatePerimeter(swapped, altitude);
+        } else {
+          rawPath = generateLawnmower(swapped, effSpacing, altitude);
+        }
+        if (rawPath && rawPath.length) {
+          console.warn('Generator succeeded after swapping lat/lng order â€” coordinate ordering mismatch.');
+        }
+      } catch (err) {
+        console.error('Generator still threw after swapping:', err);
+        rawPath = [];
+      }
+    }
+
+    if (!rawPath || rawPath.length === 0) {
+      console.error('Path generation failed. Inputs:', { polygon: polyAsArrays, effSpacing, altitude, pattern });
+      alert('Could not generate path: generator returned no points. Check polygon size, spacing, or open the console for details.');
+      return;
+    }
+
+    const normalized = normalizeGeneratorOutput(rawPath, altitude);
+
+    if (!normalized.length) {
+      console.error('Normalized path empty after attempting to interpret generator output', rawPath);
+      alert('Generator produced an unrecognized output format. Check console for raw output.');
+      return;
+    }
+
+    setGeneratedPath(normalized);
+  };
+
+  // -----------------------
+  // Create mission (safe)
+  // -----------------------
+  const handleCreate = async () => {
+    if (!selectedDrone) {
+      alert('Please select a drone before creating the mission.');
+      return;
+    }
+    if (!generatedPath || generatedPath.length === 0) {
+      alert('Generate flight path before creating mission.');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      // downsample to keep payload reasonable
+      const capped = downsampleWaypoints(generatedPath, 800);
+
+      // sanitize & coerce types
+      const safeFlightPath = capped.map((p, idx) => ({
+        lat: Number(p.lat),
+        lng: Number(p.lng),
+        alt: Number(p.alt ?? altitude),
+        order: Number(p.order ?? idx),
+      }));
+
+      // client-side validation
+      for (let i = 0; i < safeFlightPath.length; i++) {
+        const wp = safeFlightPath[i];
+        if (!Number.isFinite(wp.lat) || !Number.isFinite(wp.lng)) {
+          alert(`Waypoint ${i + 1} has invalid coordinates. Aborting.`);
+          setBusy(false);
+          return;
+        }
+      }
+
+      // payload uses canonical pattern value (pattern state is canonical)
+      const payload = {
+        name: name || `Mission ${new Date().toISOString()}`,
+        drone: selectedDrone,
+        pattern, // canonical: 'grid' | 'perimeter' | 'crosshatch'
+        altitude,
+        overlap,
+        swathWidth,
+        flightPath: safeFlightPath,
+        areaCoordinates: polygon?.map((pt) =>
+          Array.isArray(pt) ? { lat: pt[0], lng: pt[1] } : pt
+        ),
+        sensors: ['camera'],
+      };
+
+      // log payload size for debugging
+      try {
+        const size = new Blob([JSON.stringify(payload)]).size;
+        console.log('Payload size (bytes):', size, 'â‰ˆ', (size / 1024 / 1024).toFixed(2), 'MB');
+      } catch (e) {
+        console.warn('Could not compute payload size', e);
+      }
+
+      await createMission(payload);
+      alert('Mission created successfully');
+      navigate('/missions');
+    } catch (err) {
+      console.error('Create mission failed (client):', err);
+      console.error('Server response body (if any):', err?.response?.data);
+      const msg = err?.response?.data?.error || err?.response?.data?.message || err?.message || 'Unknown error';
+      alert('Failed to create mission: ' + msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Preview for LiveMap
+  const mapMissionsPreview = useMemo(() => {
+    if (!generatedPath || generatedPath.length === 0 || !previewOnMap) return [];
+    return [
+      {
+        _id: 'preview',
+        name: name || 'Preview Mission',
+        flightPath: generatedPath.map((p) => ({ lat: p.lat, lng: p.lng, alt: p.alt })),
+        area: polygon?.map((pt) =>
+          Array.isArray(pt) ? { lat: pt[0], lng: pt[1] } : pt
+        ),
+      },
+    ];
+  }, [generatedPath, previewOnMap, name, polygon]);
+
+  return (
+    <div className="max-w-6xl mx-auto p-6 space-y-6">
+      <h1 className="text-2xl font-semibold">Mission Planner</h1>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* LEFT SIDE: Map + Preview */}
+        <div className="lg:col-span-2">
+          <div className="bg-white rounded-2xl shadow p-4">
+            <h2 className="font-medium mb-2">Draw Survey Area</h2>
+            <PolygonDrawer
+              initialCenter={[20, 0]}
+              initialZoom={3}
+              onPolygonComplete={(pts) => {
+                setPolygon(pts);
+                setGeneratedPath([]);
+              }}
+            />
+          </div>
+
+          <div className="mt-4 bg-white rounded-2xl shadow p-4">
+            <h2 className="font-medium mb-2">Flight Path Preview</h2>
+            <div className="flex items-center gap-2 mb-3">
+              <button onClick={generate} className="px-3 py-2 bg-blue-600 text-white rounded">Generate Path</button>
+
+              <label className="flex items-center gap-2 text-sm">
+                <input type="checkbox" checked={previewOnMap} onChange={(e) => setPreviewOnMap(e.target.checked)} />
+                Show on map
+              </label>
+
+              <div className="ml-auto text-xs text-gray-500">
+                Generated waypoints: {generatedPath?.length ?? 0}
+              </div>
+            </div>
+
+            {generatedPath.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-sm text-gray-600">Waypoints:</div>
+                <div className="text-xs bg-gray-50 p-2 rounded">
+                  {generatedPath.slice(0, 8).map((wp, i) => (
+                    <div key={i}>
+                      {i + 1}. {wp.lat.toFixed(6)}, {wp.lng.toFixed(6)} â€” alt {wp.alt}m
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* RIGHT SIDE: Form */}
+        <div>
+          <div className="bg-white rounded-2xl shadow p-4 space-y-3">
+            <div>
+              <label className="text-sm text-gray-600">Mission name</label>
+              <input value={name} onChange={(e) => setName(e.target.value)} className="w-full border rounded px-2 py-2 mt-1 text-sm" placeholder="Optional mission name" />
+            </div>
+
+            <div>
+              <label className="text-sm text-gray-600">Assign Drone</label>
+              <select value={selectedDrone} onChange={(e) => setSelectedDrone(e.target.value)} className="w-full border rounded px-2 py-2 mt-1 text-sm">
+                <option value="">-- Select a drone --</option>
+                {drones.map((d) => (
+                  <option key={d._id} value={d._id}>
+                    {d.name || `Drone ${d._id.substring(0, 6)}`} ({d.status})
+                  </option>
+                ))}
+              </select>
+              {drones.length === 0 && <div className="text-xs text-gray-400 mt-1">No drones available. Add one in Fleet.</div>}
+            </div>
+
+            <div>
+              <label className="text-sm text-gray-600">Pattern</label>
+              <select value={pattern} onChange={(e) => setPattern(e.target.value)} className="w-full border rounded px-2 py-2 mt-1 text-sm">
+                {/* values are canonical */}
+                <option value="grid">Lawnmower (grid)</option>
+                <option value="perimeter">Perimeter</option>
+                <option value="crosshatch">Crosshatch</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="text-sm text-gray-600">Altitude (m)</label>
+              <input type="number" value={altitude} onChange={(e) => setAltitude(Number(e.target.value))} className="w-full border rounded px-2 py-2 mt-1 text-sm" />
+            </div>
+
+            <div>
+              <label className="text-sm text-gray-600">Swath width (m)</label>
+              <input type="number" value={swathWidth} onChange={(e) => setSwathWidth(Number(e.target.value))} className="w-full border rounded px-2 py-2 mt-1 text-sm" />
+              <div className="text-xs text-gray-400">Camera swath width at given altitude. Used for spacing.</div>
+            </div>
+
+            <div>
+              <label className="text-sm text-gray-600">Overlap (%)</label>
+              <input type="number" min={0} max={90} value={overlap} onChange={(e) => setOverlap(Number(e.target.value))} className="w-full border rounded px-2 py-2 mt-1 text-sm" />
+            </div>
+
+            <div className="pt-2">
+              <button onClick={handleCreate} disabled={busy} className="w-full px-3 py-2 bg-green-600 text-white rounded">
+                {busy ? 'Creatingâ€¦' : 'Create Mission'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Map preview */}
+      {previewOnMap && (
+        <div className="bg-white rounded-2xl shadow p-4">
+          <h3 className="font-medium mb-2">Map Preview</h3>
+          <LiveMap
+            missions={mapMissionsPreview}
+            livePositions={{}}
+            center={polygon?.length ? [polygon[0][0], polygon[0][1]] : [20, 0]}
+            zoom={polygon ? 14 : 2}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\Missions.jsx
+// frontend/src/pages/Missions.jsx
+import React, { useEffect, useMemo, useState } from 'react';
+import { fetchMissions, startMission, pauseMission, resumeMission, abortMission } from '../services/api';
+import { socket } from '../services/socket';
+import { format } from 'date-fns';
+import clsx from 'clsx';
+
+const PATTERN_LABEL = {
+  grid: 'Lawnmower',
+  lawnmower: 'Lawnmower',
+  crosshatch: 'Crosshatch',
+  perimeter: 'Perimeter',
+};
+
+export default function Missions() {
+  const [missions, setMissions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [q, setQ] = useState('');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 10;
+  const [selectedMission, setSelectedMission] = useState(null);
+
+  useEffect(() => {
+    loadMissions();
+    // listen for realtime updates
+    const handler = (data) => {
+      setMissions((prev) =>
+        prev.map((m) =>
+          m._id === data.missionId
+            ? { ...m, status: data.status, progress: data.progress }
+            : m
+        )
+      );
+    };
+    socket.on('missionProgress', handler);
+    return () => socket.off('missionProgress', handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadMissions() {
+    setLoading(true);
+    try {
+      const data = await fetchMissions();
+      setMissions(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const filtered = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return missions;
+    return missions.filter((m) =>
+      [m.name, m.pattern, m.parameters?.pattern, m.status, m._id].some((v) =>
+        v && v.toString().toLowerCase().includes(s)
+      )
+    );
+  }, [missions, q]);
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pageItems = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  const handleStart = async (id) => {
+    try {
+      await startMission(id);
+      await loadMissions();
+    } catch (err) {
+      console.error(err);
+      alert(
+        'Failed to start mission: ' +
+          (err?.response?.data?.error || err.message)
+      );
+    }
+  };
+
+  const handleControl = async (action, id) => {
+    try {
+      if (action === 'pause') await pauseMission(id);
+      if (action === 'resume') await resumeMission(id);
+      if (action === 'abort') await abortMission(id);
+      await loadMissions();
+    } catch (err) {
+      console.error(err);
+      alert(
+        `Failed to ${action} mission: ` +
+          (err?.response?.data?.error || err.message)
+      );
+    }
+  };
+
+  const patternText = (m) => {
+    const key = m.pattern ?? m.parameters?.pattern;
+    return PATTERN_LABEL[key] ?? (key || 'Lawnmower');
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6">
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h1 className="text-2xl font-semibold">Missions</h1>
+          <div className="text-sm text-gray-500">
+            Create, start and control missions.
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setPage(1);
+            }}
+            placeholder="Search missions..."
+            className="border rounded px-3 py-2 text-sm"
+          />
+          <button
+            onClick={loadMissions}
+            className="px-3 py-2 border rounded text-sm"
+          >
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl shadow overflow-hidden">
+        <table className="min-w-full text-sm">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="text-left px-4 py-2">Mission</th>
+              <th className="text-left px-4 py-2">Pattern</th>
+              <th className="text-left px-4 py-2">Progress</th>
+              <th className="text-left px-4 py-2">Status</th>
+              <th className="text-left px-4 py-2">Waypoints</th>
+              <th className="text-left px-4 py-2">Last Updated</th>
+              <th className="text-left px-4 py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr>
+                <td colSpan={7} className="px-4 py-4 text-gray-500">
+                  Loadingâ€¦
+                </td>
+              </tr>
+            )}
+            {!loading && pageItems.length === 0 && (
+              <tr>
+                <td colSpan={7} className="px-4 py-6 text-gray-500">
+                  No missions
+                </td>
+              </tr>
+            )}
+            {pageItems.map((m) => (
+              <tr key={m._id} className="border-t hover:bg-gray-50">
+                <td className="px-4 py-3">
+                  <div className="font-medium">
+                    {m.name || `Mission ${m._id.substring(0, 6)}`}
+                  </div>
+                  <div className="text-xs text-gray-400">{m._id}</div>
+                </td>
+
+                <td className="px-4 py-3">{patternText(m)}</td>
+
+                <td className="px-4 py-3 w-56">
+                  <div className="w-full bg-gray-100 h-3 rounded-full overflow-hidden">
+                    <div
+                      style={{ width: `${m.progress ?? 0}%` }}
+                      className="h-full bg-blue-600"
+                    />
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">
+                    {m.progress ?? 0}%
+                  </div>
+                </td>
+
+                <td className="px-4 py-3">
+                  <span
+                    className={clsx(
+                      'px-2 py-1 rounded-md text-xs',
+                      m.status === 'completed'
+                        ? 'bg-gray-100 text-gray-700'
+                        : m.status === 'in-progress'
+                        ? 'bg-blue-100 text-blue-700'
+                        : m.status === 'aborted'
+                        ? 'bg-red-100 text-red-700'
+                        : 'bg-yellow-100 text-yellow-700'
+                    )}
+                  >
+                    {m.status || 'planned'}
+                  </span>
+                </td>
+
+                <td className="px-4 py-3">{m.flightPath?.length ?? 0}</td>
+                <td className="px-4 py-3 text-sm text-gray-500">
+                  {m.updatedAt ? format(new Date(m.updatedAt), 'PP p') : 'â€”'}
+                </td>
+
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => handleStart(m._id)}
+                      className="px-2 py-1 text-xs bg-green-600 text-white rounded"
+                    >
+                      Start
+                    </button>
+                    <button
+                      onClick={() => handleControl('pause', m._id)}
+                      className="px-2 py-1 text-xs bg-yellow-400 rounded"
+                    >
+                      Pause
+                    </button>
+                    <button
+                      onClick={() => handleControl('resume', m._id)}
+                      className="px-2 py-1 text-xs bg-indigo-600 text-white rounded"
+                    >
+                      Resume
+                    </button>
+                    <button
+                      onClick={() => handleControl('abort', m._id)}
+                      className="px-2 py-1 text-xs bg-red-500 text-white rounded"
+                    >
+                      Abort
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        {/* pagination */}
+        <div className="flex items-center justify-between px-4 py-3 border-t">
+          <div className="text-sm text-gray-500">
+            Showing {(page - 1) * PAGE_SIZE + 1}â€“
+            {Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length}{' '}
+            missions
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              className="px-3 py-1 border rounded"
+            >
+              Prev
+            </button>
+            <div className="px-3 py-1 text-sm">
+              Page {page} / {totalPages}
+            </div>
+            <button
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              className="px-3 py-1 border rounded"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\Monitor.jsx
+import React, { useEffect, useMemo, useState, useRef } from 'react';
+import {
+  MapContainer,
+  TileLayer,
+  Polyline,
+  Marker,
+  Popup,
+  CircleMarker,
+  Polygon,
+  Tooltip,
+  useMap,
+} from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { fetchMissions, pauseMission, resumeMission, abortMission } from '../services/api';
+import { socket } from '../services/socket';
+
+// Fix leaflet default icon
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: new URL('leaflet/dist/images/marker-icon-2x.png', import.meta.url).href,
+  iconUrl: new URL('leaflet/dist/images/marker-icon.png', import.meta.url).href,
+  shadowUrl: new URL('leaflet/dist/images/marker-shadow.png', import.meta.url).href,
+});
+
+// --- Utility functions ---
+function normalizePoint(pt) {
+  if (!pt) return null;
+  if (Array.isArray(pt) && pt.length >= 2) {
+    const a = Number(pt[0]),
+      b = Number(pt[1]);
+    if (!isFinite(a) || !isFinite(b)) return null;
+    if (Math.abs(a) > 90 && Math.abs(b) <= 90) return [b, a];
+    return [a, b];
+  }
+  if (typeof pt === 'object' && pt !== null && ('lat' in pt || 'lng' in pt)) {
+    const lat = Number(pt.lat ?? pt.latitude ?? pt[0]);
+    const lng = Number(pt.lng ?? pt.longitude ?? pt[1]);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    return [lat, lng];
+  }
+  return null;
+}
+
+function closePolygon(coords) {
+  if (!coords || coords.length < 3) return coords;
+  const first = coords[0],
+    last = coords[coords.length - 1];
+  if (Math.abs(first[0] - last[0]) < 1e-9 && Math.abs(first[1] - last[1]) < 1e-9) return coords;
+  return [...coords, first];
+}
+
+function FitToBounds({ mission }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!mission) return;
+    const area = closePolygon((mission.area || []).map(pt => normalizePoint(pt)).filter(Boolean));
+    if (area.length >= 3) {
+      const bounds = L.latLngBounds(area);
+      map.fitBounds(bounds, { padding: [24, 24] });
+      return;
+    }
+    const coords = (mission.flightPath || []).map(wp => [wp.lat, wp.lng]);
+    if (coords.length >= 2) {
+      map.fitBounds(L.latLngBounds(coords), { padding: [24, 24] });
+      return;
+    }
+    const start = mission.flightPath?.[0];
+    if (start) map.setView([start.lat, start.lng], 15);
+  }, [mission, map]);
+  return null;
+}
+
+function SmallAltitudeChart({ history = [] }) {
+  const data = history.slice(-80).map(h => ({ t: h.t, alt: h.pos?.alt ?? 0 }));
+  if (data.length === 0) return <div className="text-xs text-gray-500">No altitude data</div>;
+  const min = Math.min(...data.map(d => d.alt));
+  const max = Math.max(...data.map(d => d.alt));
+  const w = 300,
+    h = 80;
+  const points = data
+    .map((d, i) => {
+      const x = (i / (data.length - 1)) * w;
+      const y = h - ((d.alt - min) / (max - min || 1)) * h;
+      return `${x},${y}`;
+    })
+    .join(' ');
+  return (
+    <svg width="100%" viewBox={`0 0 ${w} ${h}`} className="rounded overflow-hidden bg-gray-50">
+      <polyline fill="none" stroke="#2563eb" strokeWidth="2" points={points} />
+    </svg>
+  );
+}
+
+// --- Main Component ---
+export default function MonitorRevamp() {
+  const [missions, setMissions] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [livePositions, setLivePositions] = useState({});
+  const historyRef = useRef({});
+  const [telemetry, setTelemetry] = useState({});
+
+  const [showAll, setShowAll] = useState(true);
+  const [showWaypoints, setShowWaypoints] = useState(true);
+  const [showTrails, setShowTrails] = useState(true);
+  const [areaOpacity, setAreaOpacity] = useState(0.22);
+  const [basemap, setBasemap] = useState('osm');
+
+  // --- Load missions & socket telemetry ---
+  useEffect(() => {
+    loadMissions();
+    function handleProgress(data) {
+      const { missionId, currentWaypoint, progress, status, battery, speed } = data;
+      if (currentWaypoint) {
+        setLivePositions(prev => ({ ...prev, [missionId]: currentWaypoint }));
+        const entry = { t: Date.now(), pos: currentWaypoint, progress };
+        historyRef.current[missionId] = historyRef.current[missionId] || [];
+        historyRef.current[missionId].push(entry);
+        if (historyRef.current[missionId].length > 5000) historyRef.current[missionId].shift();
+        setTelemetry(prev => ({
+          ...prev,
+          [missionId]: {
+            battery: typeof battery === 'number' ? battery : prev?.[missionId]?.battery ?? 100,
+            alt: currentWaypoint.alt,
+            speed: typeof speed === 'number' ? speed : prev?.[missionId]?.speed ?? 0,
+            lastSeen: Date.now(),
+          },
+        }));
+      }
+      setMissions(prev =>
+        prev.map(m => (m._id === missionId ? { ...m, progress, status } : m)),
+      );
+    }
+    socket.on('missionProgress', handleProgress);
+    return () => socket.off('missionProgress', handleProgress);
+  }, []);
+
+  async function loadMissions() {
+    try {
+      const data = await fetchMissions();
+      setMissions(Array.isArray(data) ? data : []);
+      if (data && data.length && !selected) setSelected(data[0]);
+    } catch (e) {
+      console.error('Failed to load missions', e);
+    }
+  }
+
+  // --- Simulated fallback telemetry ---
+  useEffect(() => {
+    const id = setInterval(() => {
+      missions.forEach(m => {
+        if (!m) return;
+        const mid = m._id;
+        const last = livePositions[mid];
+        if (!last && (m.status === 'in-progress' || m.status === 'started')) {
+          const fp = m.flightPath || [];
+          if (fp.length) {
+            const sample = fp[Math.floor(fp.length * 0.2)];
+            const fake = { lat: sample.lat, lng: sample.lng, alt: sample.alt ?? 30 };
+            setLivePositions(prev => ({ ...prev, [mid]: fake }));
+            historyRef.current[mid] = historyRef.current[mid] || [];
+            historyRef.current[mid].push({ t: Date.now(), pos: fake, progress: m.progress ?? 0 });
+            if (historyRef.current[mid].length > 5000) historyRef.current[mid].shift();
+            setTelemetry(prev => ({
+              ...prev,
+              [mid]: {
+                battery: (prev?.[mid]?.battery ?? 100) - 0.01,
+                alt: fake.alt,
+                speed: prev?.[mid]?.speed ?? 2,
+                lastSeen: Date.now(),
+              },
+            }));
+          }
+        }
+      });
+    }, 1800);
+    return () => clearInterval(id);
+  }, [missions, livePositions]);
+
+  const selectedMission = useMemo(
+    () => missions.find(m => selected && m._id === selected._id) || selected,
+    [missions, selected],
+  );
+  const selectedHistory = useMemo(
+    () => (selectedMission ? (historyRef.current[selectedMission._id] || []).slice() : []),
+    [selectedMission],
+  );
+  const selectedTelemetry = selectedMission ? telemetry[selectedMission._id] || {} : {};
+
+  async function handleControl(action, missionId) {
+    if (!missionId) return;
+    try {
+      if (action === 'pause') await pauseMission(missionId);
+      if (action === 'resume') await resumeMission(missionId);
+      if (action === 'abort') await abortMission(missionId);
+      await loadMissions();
+    } catch (err) {
+      console.error(err);
+      alert(`Failed to ${action} mission: ` + (err?.response?.data?.error || err.message));
+    }
+  }
+
+  const missionsOnMap = showAll ? missions : selectedMission ? [selectedMission] : [];
+
+  // --- Render ---
+  return (
+    <div className="h-full min-h-screen p-6 bg-gray-50">
+      <div className="max-w-[1400px] mx-auto">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-3xl font-bold">Mission Monitor â€” Revamped</h1>
+            <div className="text-sm text-gray-500">
+              Clearer map, filled areas, trails, telemetry fallbacks & better controls
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={loadMissions}
+              className="px-3 py-2 bg-white border rounded shadow-sm text-sm"
+            >
+              Refresh
+            </button>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={showAll}
+                onChange={e => setShowAll(e.target.checked)}
+              />{' '}
+              Show all
+            </label>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+          {/* LEFT: mission list */}
+          <div className="lg:col-span-1">
+            <div className="bg-white rounded-2xl shadow p-4 sticky top-6">
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-medium">Active Missions</div>
+                <div className="text-xs text-gray-400">{missions.length}</div>
+              </div>
+
+              <div className="space-y-2 max-h-[60vh] overflow-auto pr-2">
+                {missions.length === 0 && (
+                  <div className="text-sm text-gray-500">No missions</div>
+                )}
+                {missions.map(m => {
+                  const isSel = selected && selected._id === m._id;
+                  return (
+                    <button
+                      key={m._id}
+                      onClick={() => setSelected(m)}
+                      className={`w-full text-left p-3 rounded-lg transition ${
+                        isSel ? 'bg-blue-600 text-white' : 'hover:bg-gray-50'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="text-sm font-medium">
+                          {m.name || `Mission ${m._id.substring(0, 6)}`}
+                        </div>
+                        <div className="text-xs text-gray-200">{m.progress ?? 0}%</div>
+                      </div>
+                      <div className="flex items-center justify-between mt-1">
+                        <div className="text-xs text-gray-200">{m.status}</div>
+                        <div className="text-xs text-gray-300">
+                          WP: {(m.flightPath || []).length}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* telemetry summary for selected */}
+              <div className="mt-4">
+                <div className="text-sm font-medium mb-2">Telemetry</div>
+                <div className="grid grid-cols-2 gap-2 text-xs text-gray-600">
+                  <div className="bg-gray-50 p-2 rounded">
+                    Battery
+                    <div className="font-semibold text-sm">
+                      {selectedTelemetry.battery?.toFixed
+                        ? selectedTelemetry.battery.toFixed(1) + '%'
+                        : 'â€”'}
+                    </div>
+                  </div>
+                  <div className="bg-gray-50 p-2 rounded">
+                    Altitude<div className="font-semibold text-sm">{selectedTelemetry.alt ?? 'â€”'}</div>
+                  </div>
+                  <div className="bg-gray-50 p-2 rounded">
+                    Speed<div className="font-semibold text-sm">{selectedTelemetry.speed ?? 'â€”'}</div>
+                  </div>
+                  <div className="bg-gray-50 p-2 rounded">
+                    Last seen
+                    <div className="font-semibold text-sm">
+                      {selectedTelemetry.lastSeen
+                        ? new Date(selectedTelemetry.lastSeen).toLocaleTimeString()
+                        : 'â€”'}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <SmallAltitudeChart history={selectedHistory} />
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 bg-white rounded-2xl shadow p-4">
+              <div className="text-sm font-medium mb-2">Controls</div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleControl('pause', selectedMission?._id)}
+                  className="px-3 py-2 bg-yellow-300 rounded text-xs"
+                >
+                  Pause
+                </button>
+                <button
+                  onClick={() => handleControl('resume', selectedMission?._id)}
+                  className="px-3 py-2 bg-indigo-600 text-white rounded text-xs"
+                >
+                  Resume
+                </button>
+                <button
+                  onClick={() => handleControl('abort', selectedMission?._id)}
+                  className="px-3 py-2 bg-red-500 text-white rounded text-xs"
+                >
+                  Abort
+                </button>
+              </div>
+              <div className="mt-3 text-sm text-gray-500">Map Options</div>
+              <div className="flex flex-col gap-2 mt-2 text-sm">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={showWaypoints}
+                    onChange={e => setShowWaypoints(e.target.checked)}
+                  />{' '}
+                  Show waypoints
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={showTrails}
+                    onChange={e => setShowTrails(e.target.checked)}
+                  />{' '}
+                  Show trails
+                </label>
+                <label className="flex items-center gap-2">
+                  Area opacity
+                  <input
+                    type="range"
+                    min={0}
+                    max={0.6}
+                    step={0.02}
+                    value={areaOpacity}
+                    onChange={e => setAreaOpacity(Number(e.target.value))}
+                    className="ml-2"
+                  />
+                </label>
+                <label className="flex items-center gap-2">
+                  Basemap
+                  <select
+                    value={basemap}
+                    onChange={e => setBasemap(e.target.value)}
+                    className="ml-2 text-sm border rounded px-2 py-1"
+                  >
+                    <option value="osm">OpenStreetMap</option>
+                    <option value="sat">Satellite (Stamen Toner)</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: map + mission details */}
+          <div className="lg:col-span-3 space-y-4">
+            <div className="bg-white rounded-2xl shadow p-3">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <div className="text-lg font-semibold">Map Preview</div>
+                  <div className="text-xs text-gray-500">
+                    Click a mission to focus it. Use controls to show all missions or fine-tune map.
+                  </div>
+                </div>
+                <div className="text-sm text-gray-500">
+                  Selected: {selectedMission?.name ?? 'â€”'}
+                </div>
+              </div>
+              <div style={{ height: '68vh' }} className="rounded overflow-hidden">
+                <MapContainer center={[20, 0]} zoom={2} style={{ height: '100%', width: '100%' }}>
+                  {basemap === 'osm' ? (
+                    <TileLayer
+                      url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                      attribution="&copy; OpenStreetMap contributors"
+                    />
+                  ) : (
+                    <TileLayer
+                      url="https://stamen-tiles.a.ssl.fastly.net/toner/{z}/{x}/{y}.png"
+                      attribution="Map tiles by Stamen"
+                    />
+                  )}
+                  {!showAll && selectedMission && <FitToBounds mission={selectedMission} />}
+
+                  {/* Polygons */}
+                  {missionsOnMap.map(m => {
+                    const poly = closePolygon(
+                      (m.area || []).map(pt => normalizePoint(pt)).filter(Boolean),
+                    );
+                    if (poly.length < 3) return null;
+                    const highlight = selected && selected._id === m._id;
+                    return (
+                      <Polygon
+                        key={`area-${m._id}`}
+                        positions={poly}
+                        pathOptions={{
+                          color: highlight ? '#065f46' : '#10b981',
+                          weight: highlight ? 3 : 2,
+                          fillColor: highlight ? '#10b981' : '#34d399',
+                          fillOpacity: areaOpacity,
+                          dashArray: highlight ? null : '6 6',
+                        }}
+                      />
+                    );
+                  })}
+
+                  {/* Flight paths */}
+                  {missionsOnMap.map(m => {
+                    const coords = (m.flightPath || []).map(wp => [wp.lat, wp.lng]);
+                    if (!coords.length) return null;
+                    const highlight = selected && selected._id === m._id;
+                    return (
+                      <Polyline
+                        key={`path-${m._id}`}
+                        positions={coords}
+                        pathOptions={{
+                          color: highlight ? '#1e40af' : '#2563eb',
+                          weight: highlight ? 4 : 3,
+                        }}
+                      />
+                    );
+                  })}
+
+                  {/* Waypoints */}
+                  {showWaypoints &&
+                    missionsOnMap.map(m =>
+                      (m.flightPath || []).map((wp, i) => (
+                        <Marker
+                          key={`${m._id}-wp-${i}`}
+                          position={[wp.lat, wp.lng]}
+                          icon={L.divIcon({
+                            className: 'custom-div-icon',
+                            html: `<div style="background:#fff;border:1px solid #444;border-radius:4px;padding:1px 3px;font-size:10px;">${i + 1}</div>`,
+                          })}
+                        >
+                          <Popup>
+                            WP {i + 1}
+                            <br /> Alt {wp.alt}
+                          </Popup>
+                        </Marker>
+                      )),
+                    )}
+
+                  {/* Live positions & trails */}
+                  {missionsOnMap.map(m => {
+                    const pos = livePositions[m._id];
+                    const highlight = selected && selected._id === m._id;
+                    const trail = (historyRef.current[m._id] || []).map(h => h.pos);
+                    return (
+                      <React.Fragment key={`live-${m._id}`}>
+                        {pos && (
+                          <Marker
+                            position={[pos.lat, pos.lng]}
+                            icon={L.divIcon({
+                              className: '',
+                              html: `<div style="width:16px;height:16px;background:${
+                                highlight ? '#dc2626' : '#ef4444'
+                              };border-radius:50%;border:2px solid white;"></div>`,
+                            })}
+                          >
+                            <Popup>
+                              <div className="text-sm">
+                                Drone<br />
+                                Alt: {pos.alt}
+                              </div>
+                            </Popup>
+                          </Marker>
+                        )}
+                        {showTrails && trail.length >= 2 && (
+                          <Polyline
+                            positions={trail.map(p => [p.lat, p.lng])}
+                            pathOptions={{
+                              color: highlight ? '#ef4444' : '#f87171',
+                              weight: 2,
+                              dashArray: '3 4',
+                            }}
+                          />
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </MapContainer>
+              </div>
+            </div>
+
+            {/* Selected details */}
+            {selectedMission && (
+              <div className="bg-white rounded-2xl shadow p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="font-medium">Mission Details</div>
+                  <div className="text-sm text-gray-500">{selectedMission.status}</div>
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm text-gray-700">
+                  <div>
+                    Name
+                    <div className="font-semibold">{selectedMission.name}</div>
+                  </div>
+                  <div>
+                    Progress
+                    <div className="font-semibold">{selectedMission.progress ?? 0}%</div>
+                  </div>
+                  <div>
+                    Waypoints
+                    <div className="font-semibold">
+                      {(selectedMission.flightPath || []).length}
+                    </div>
+                  </div>
+                  <div>
+                    Created
+                    <div className="font-semibold">
+                      {selectedMission.createdAt
+                        ? new Date(selectedMission.createdAt).toLocaleString()
+                        : 'â€”'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\pages\Reports.jsx
+// src/pages/Reports.jsx
+import { useEffect, useState, useMemo } from "react"
+import { fetchMissions } from "../services/api"
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  PieChart, Pie, Cell, BarChart, Bar
+} from "recharts"
+
+const COLORS = ["#3b82f6", "#22c55e", "#facc15", "#ef4444"]
+
+export default function Reports() {
+  const [missions, setMissions] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState("")
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const data = await fetchMissions()
+        setMissions(data || [])
+      } catch (e) {
+        console.error("Failed to load missions", e)
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+  }, [])
+
+  // ---- KPIs ----
+  const kpis = useMemo(() => {
+    const total = missions.length
+    const completed = missions.filter(m => m.status === "completed").length
+    const inProgress = missions.filter(m => m.status === "in-progress").length
+    const aborted = missions.filter(m => m.status === "aborted").length
+    const completionRate = total ? `${Math.round((completed / total) * 100)}%` : "0%"
+    return [
+      { title: "Total Missions", value: total },
+      { title: "Completed", value: completed },
+      { title: "In Progress", value: inProgress },
+      { title: "Aborted", value: aborted },
+      { title: "Completion Rate", value: completionRate },
+    ]
+  }, [missions])
+
+  // ---- Charts ----
+  const missionsOverTime = useMemo(() => {
+    const map = {}
+    missions.forEach(m => {
+      const d = new Date(m.createdAt || m.startTime || Date.now())
+      const key = d.toISOString().split("T")[0]
+      map[key] = (map[key] || 0) + 1
+    })
+    return Object.entries(map).map(([date, count]) => ({ date, count }))
+  }, [missions])
+
+  const statusDistribution = useMemo(() => {
+    const map = {}
+    missions.forEach(m => {
+      map[m.status || "unknown"] = (map[m.status || "unknown"] || 0) + 1
+    })
+    return Object.entries(map).map(([name, value]) => ({ name, value }))
+  }, [missions])
+
+  const pathLengthByMission = useMemo(() => {
+    return missions.map(m => ({
+      mission: m.name || m._id.substring(0, 6),
+      waypoints: m.flightPath?.length || 0,
+    }))
+  }, [missions])
+
+  const filteredTable = useMemo(() => {
+    return missions.filter(m =>
+      (m.name || m._id)
+        .toLowerCase()
+        .includes(search.toLowerCase())
+    )
+  }, [missions, search])
+
+  return (
+    <div className="max-w-7xl mx-auto p-6 space-y-6">
+      <h1 className="text-3xl font-bold">Reports & Analytics</h1>
+      <p className="text-gray-600">Analytics, summaries, and insights from completed missions.</p>
+
+      {loading ? (
+        <div className="text-gray-500">LoadingÃ¢â‚¬Â¦</div>
+      ) : (
+        <>
+          {/* KPI Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+            {kpis.map((kpi, i) => (
+              <div key={i} className="bg-white rounded-2xl shadow p-5 hover:shadow-md transition">
+                <div className="text-gray-500 text-sm">{kpi.title}</div>
+                <div className="text-2xl font-semibold mt-1">{kpi.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Charts */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Trend Line */}
+            <div className="bg-white rounded-2xl shadow p-4">
+              <h2 className="font-medium mb-2">Missions Over Time</h2>
+              <div className="h-72">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={missionsOverTime}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="date" />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    <Line type="monotone" dataKey="count" stroke="#3b82f6" strokeWidth={2} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Status Pie */}
+            <div className="bg-white rounded-2xl shadow p-4">
+              <h2 className="font-medium mb-2">Missions by Status</h2>
+              <div className="h-72">
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={statusDistribution}
+                      dataKey="value"
+                      cx="50%"
+                      cy="50%"
+                      outerRadius={90}
+                      label
+                    >
+                      {statusDistribution.map((_, i) => (
+                        <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Waypoints Bar */}
+            <div className="bg-white rounded-2xl shadow p-4 lg:col-span-2">
+              <h2 className="font-medium mb-2">Waypoints by Mission</h2>
+              <div className="h-80">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={pathLengthByMission}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="mission" />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    <Bar dataKey="waypoints" fill="#22c55e" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          {/* Mission Table */}
+          <div className="bg-white rounded-2xl shadow">
+            <div className="flex items-center justify-between p-4 border-b">
+              <h2 className="font-medium">Detailed Missions</h2>
+              <div className="flex items-center space-x-2">
+                <input
+                  type="text"
+                  placeholder="Search missions..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="pl-3 pr-3 py-1 border rounded-md text-sm focus:ring focus:ring-blue-200"
+                />
+                <button
+                  onClick={() => {
+                    const blob = new Blob(
+                      [JSON.stringify(filteredTable, null, 2)],
+                      { type: "application/json" }
+                    )
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement("a")
+                    a.href = url
+                    a.download = "missions-report.json"
+                    a.click()
+                  }}
+                  className="px-3 py-1 text-sm bg-blue-600 text-white rounded-md"
+                >
+                  Export
+                </button>
+              </div>
+            </div>
+            <div className="p-4 overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b text-gray-600">
+                    <th className="py-2">Mission</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th>Waypoints</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredTable.map((m, i) => (
+                    <tr key={i} className="border-b hover:bg-gray-50">
+                      <td className="py-2">{m.name || m._id}</td>
+                      <td>{m.status}</td>
+                      <td>{m.createdAt ? new Date(m.createdAt).toLocaleString() : "Ã¢â‚¬â€"}</td>
+                      <td>{m.flightPath?.length || 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\services\api.js
+// frontend/src/services/api.js
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE || 'http://localhost:5000',
+});
+
+// -------------------- DRONES --------------------
+
+// Get all drones
+export const fetchDrones = async () => {
+  const { data } = await api.get('/api/drones');
+  return data;
+};
+
+// Add a new drone
+export const addDrone = async (payload) => {
+  const { data } = await api.post('/api/drones', payload);
+  return data;
+};
+
+// Update a drone
+export const updateDrone = async (id, payload) => {
+  const { data } = await api.put(`/api/drones/${id}`, payload);
+  return data;
+};
+
+// Delete a drone
+export const deleteDrone = async (id) => {
+  const { data } = await api.delete(`/api/drones/${id}`);
+  return data;
+};
+
+// -------------------- MISSIONS --------------------
+
+export const fetchMissions = async () => {
+  const { data } = await api.get('/api/missions');
+  return data;
+};
+
+export const createMission = async (payload) => {
+  const { data } = await api.post('/api/missions', payload);
+  return data;
+};
+
+export const startMission = async (missionId) => {
+  const { data } = await api.post(`/api/missions/${missionId}/start`);
+  return data;
+};
+
+export const pauseMission = async (missionId) => {
+  const { data } = await api.patch(`/api/missions/${missionId}/pause`);
+  return data;
+};
+
+export const resumeMission = async (missionId) => {
+  const { data } = await api.patch(`/api/missions/${missionId}/resume`);
+  return data;
+};
+
+export const abortMission = async (missionId) => {
+  const { data } = await api.patch(`/api/missions/${missionId}/abort`);
+  return data;
+};
+
+export default api;
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\services\socket.js
+// frontend/src/services/socket.js
+import { io } from 'socket.io-client';
+
+const SOCKET_URL = import.meta.env.VITE_API_BASE || 'http://localhost:5000';
+export const socket = io(SOCKET_URL, {
+  transports: ['websocket'],
+  autoConnect: true,
+});
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\utils\waypointGenerator.js
+// frontend/src/utils/waypointGenerator.js
+import * as turf from '@turf/turf';
+
+/**
+ * Convert spacing in meters to approx degrees latitude.
+ * Rough approximation: 1 deg lat â‰ˆ 111320 meters.
+ */
+const metersToDegLat = (meters) => meters / 111320;
+
+/**
+ * Convert degrees longitude spacing at a given latitude.
+ * 1 deg lon â‰ˆ 111320 * cos(lat)
+ */
+const metersToDegLon = (meters, lat) => {
+  const metersPerDegLon = 111320 * Math.cos((lat * Math.PI) / 180);
+  return metersPerDegLon <= 0 ? 0 : meters / metersPerDegLon;
+};
+
+/**
+ * Generate perimeter waypoints (just polygon vertices).
+ * polygon: array of [lat, lng] or GeoJSON polygon coordinates.
+ */
+export function generatePerimeter(polygonLatLngs = [], altitude = 30) {
+  // polygonLatLngs: [[lat, lng], ...]
+  return polygonLatLngs.map((p, idx) => ({
+    lat: p[0],
+    lng: p[1],
+    alt: altitude,
+    order: idx,
+  }));
+}
+
+/**
+ * Generate lawnmower/crosshatch (sweep) pattern across polygon.
+ * polygonLatLngs: array of [lat, lng]
+ * spacingMeters: distance between adjacent sweep lines in meters
+ * altitude: in meters
+ *
+ * Approach:
+ *  - Build turf polygon
+ *  - Compute bbox
+ *  - Sweep horizontal lines across bbox at step = metersToDegLat(spacingMeters)
+ *  - For each line, compute intersection points with polygon
+ *  - Pair intersections and push endpoints as waypoints; alternate direction between lines
+ *
+ * Note: This creates endpoints for sweep segments which is sufficient for demo/mission preview.
+ */
+export function generateLawnmower(polygonLatLngs = [], spacingMeters = 30, altitude = 30) {
+  if (!polygonLatLngs || polygonLatLngs.length < 3) return [];
+
+  // Convert to GeoJSON polygon: turf expects [ [lng,lat], ... ]
+  const coords = polygonLatLngs.map((p) => [p[1], p[0]]);
+  // ensure closed polygon
+  if (coords[0][0] !== coords[coords.length - 1][0] || coords[0][1] !== coords[coords.length - 1][1]) {
+    coords.push(coords[0]);
+  }
+  const polygon = turf.polygon([coords]);
+
+  const bbox = turf.bbox(polygon); // [minX, minY, maxX, maxY] in [lng, lat]
+  const [minLng, minLat, maxLng, maxLat] = bbox;
+
+  // We'll step latitude from minLat to maxLat
+  const midLat = (minLat + maxLat) / 2;
+  const deltaLatDeg = metersToDegLat(spacingMeters);
+
+  const lines = [];
+  for (let lat = minLat; lat <= maxLat + deltaLatDeg; lat += deltaLatDeg) {
+    const line = turf.lineString([
+      [minLng - 1, lat], // extend slightly beyond bbox to ensure intersection
+      [maxLng + 1, lat],
+    ]);
+    lines.push(line);
+  }
+
+  const sweepPoints = [];
+  let flip = false; // alternate direction
+
+  for (const line of lines) {
+    const intersects = turf.lineIntersect(line, polygon);
+
+    if (!intersects || intersects.features.length === 0) continue;
+
+    // get intersection points as [lng, lat]
+    const pts = intersects.features.map((f) => f.geometry.coordinates);
+    // sort by longitude
+    pts.sort((a, b) => a[0] - b[0]);
+
+    // Pair the points sequentially (0-1, 2-3, etc.)
+    for (let i = 0; i + 1 < pts.length; i += 2) {
+      const a = pts[i];
+      const b = pts[i + 1];
+
+      // endpoints as waypoints; convert to {lat,lng}
+      // Determine ordering based on flip to make continuous path
+      if (!flip) {
+        sweepPoints.push({ lat: a[1], lng: a[0], alt: altitude });
+        sweepPoints.push({ lat: b[1], lng: b[0], alt: altitude });
+      } else {
+        sweepPoints.push({ lat: b[1], lng: b[0], alt: altitude });
+        sweepPoints.push({ lat: a[1], lng: a[0], alt: altitude });
+      }
+    }
+
+    // toggle flip each line so path snakes back and forth
+    flip = !flip;
+  }
+
+  // Remove consecutive duplicates
+  const filtered = [];
+  for (let i = 0; i < sweepPoints.length; i++) {
+    const cur = sweepPoints[i];
+    const prev = filtered[filtered.length - 1];
+    if (!prev || prev.lat !== cur.lat || prev.lng !== cur.lng) {
+      filtered.push({ ...cur, order: filtered.length });
+    }
+  }
+
+  return filtered;
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\App.jsx
+import { Routes, Route } from 'react-router-dom'
+import NavBar from './components/NavBar'
+import Dashboard from './pages/Dashboard'
+import Drones from './pages/Drones'
+import Missions from './pages/Missions'
+import Monitor from './pages/Monitor'
+import Reports from './pages/Reports'
+import MissionPlanner from './pages/MissionPlanner'
+
+
+
+
+export default function App() {
+  return (
+    <div className="min-h-full">
+      <NavBar />
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/drones" element={<Drones />} />
+        <Route path="/missions" element={<Missions />} />
+        <Route path="/monitor" element={<Monitor />} />
+        <Route path="/reports" element={<Reports />} />
+        <Route path="/planner" element={<MissionPlanner />} />
+      </Routes>
+    </div>
+  )
+}
+### FILE: C:\Users\yash2\OneDrive\Desktop\Drone-App\frontend\src\main.jsx
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+import './styles/index.css'
+import 'leaflet/dist/leaflet.css';
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+)

@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Layout helpers */
+html, body, #root {
+  height: 100%;
+}
+
+/* Restore leaflet fills if some reset sets fill:none.
+   Scoped only to the leaflet container so other SVGs aren't affected. */
+.leaflet-container .leaflet-interactive {
+  /* let Leaflet set color via inline attributes; this ensures fill isn't stripped by other global rules */
+  fill: currentColor !important;
+  fill-opacity: 0.4 !important; /* fallback if an inline style somehow gets overridden */
+  vector-effect: non-scaling-stroke;
+}
+
+/* Small UX niceties */
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #f8fafc; /* tailwind bg-gray-50 */
+}
