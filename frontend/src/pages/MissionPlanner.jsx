@@ -286,21 +286,6 @@ export default function MissionPlanner() {
     return out;
   }, [generatedPath]);
 
-    const previewWaypoints = useMemo(() => {
-    if (!generatedPath || !generatedPath.length) return [];
-    // Show only a visually representative subset for map preview.
-    const maxPreviewPoints = 800;
-    if (generatedPath.length <= maxPreviewPoints) return generatedPath;
-    // pick roughly evenly-spaced points for preview
-    const step = (generatedPath.length - 1) / (maxPreviewPoints - 1);
-    const out = [];
-    for (let i = 0; i < maxPreviewPoints; i++) {
-      const idx = Math.round(i * step);
-      out.push(generatedPath[Math.min(idx, generatedPath.length - 1)]);
-    }
-    return out;
-  }, [generatedPath]);
-
   const mapMissionsPreview = useMemo(() => {
     if (!previewOnMap || !previewWaypoints.length) return [];
     return [
