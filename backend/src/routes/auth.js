@@ -14,8 +14,6 @@ function makeError(res, status, msg, extra = {}) {
   return res.status(status).json({ error: msg, ...extra });
 }
 
-
-
 // POST /api/auth/register
 router.post(
   '/register',
@@ -25,7 +23,7 @@ router.post(
     body('name').optional().isLength({ min: 1 }).withMessage('Name must be non-empty if provided'),
   ],
   async (req, res) => {
-    debugLog(req);
+    // removed debugLog which was undefined on some deployments
 
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -69,7 +67,7 @@ router.post(
   '/login',
   [body('email').isEmail().withMessage('Valid email required'), body('password').exists().withMessage('Password required')],
   async (req, res) => {
-    debugLog(req);
+    // removed debugLog which was undefined on some deployments
 
     const errors = validationResult(req);
     if (!errors.isEmpty()) {

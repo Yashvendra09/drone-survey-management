@@ -271,19 +271,33 @@ export default function MissionPlanner() {
   };
 
   // Preview for LiveMap
+  const previewWaypoints = useMemo(() => {
+    if (!generatedPath || !generatedPath.length) return [];
+    // Show only a visually representative subset for map preview.
+    const maxPreviewPoints = 800;
+    if (generatedPath.length <= maxPreviewPoints) return generatedPath;
+    // pick roughly evenly-spaced points for preview
+    const step = (generatedPath.length - 1) / (maxPreviewPoints - 1);
+    const out = [];
+    for (let i = 0; i < maxPreviewPoints; i++) {
+      const idx = Math.round(i * step);
+      out.push(generatedPath[Math.min(idx, generatedPath.length - 1)]);
+    }
+    return out;
+  }, [generatedPath]);
+
   const mapMissionsPreview = useMemo(() => {
-    if (!generatedPath || generatedPath.length === 0 || !previewOnMap) return [];
+    if (!previewOnMap || !previewWaypoints.length) return [];
     return [
       {
         _id: 'preview',
         name: name || 'Preview Mission',
-        flightPath: generatedPath.map((p) => ({ lat: p.lat, lng: p.lng, alt: p.alt })),
-        area: polygon?.map((pt) =>
-          Array.isArray(pt) ? { lat: pt[0], lng: pt[1] } : pt
-        ),
+        flightPath: previewWaypoints.map((p) => ({ lat: p.lat, lng: p.lng, alt: p.alt })),
+        area: polygon?.map((pt) => (Array.isArray(pt) ? { lat: pt[0], lng: pt[1] } : pt)),
       },
     ];
-  }, [generatedPath, previewOnMap, name, polygon]);
+  }, [previewWaypoints, previewOnMap, name, polygon]);
+
 
   // selected drone details for UI card
   const selectedDroneObj = useMemo(() => {
