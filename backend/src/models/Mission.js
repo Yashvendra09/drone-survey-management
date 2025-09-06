@@ -1,4 +1,3 @@
-// backend/src/models/Mission.js
 import mongoose from 'mongoose';
 
 const flightPointSchema = new mongoose.Schema(
@@ -6,7 +5,7 @@ const flightPointSchema = new mongoose.Schema(
     lat: { type: Number, required: true },
     lng: { type: Number, required: true },
     altitude: { type: Number }, // canonical altitude
-    alt: { type: Number }, 
+    alt: { type: Number },
     order: { type: Number, default: 0 },
   },
   { _id: false }
@@ -15,6 +14,7 @@ const flightPointSchema = new mongoose.Schema(
 const missionSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
+
     // mission may require an assigned drone
     drone: { type: mongoose.Schema.Types.ObjectId, ref: 'Drone', required: true },
 
@@ -24,7 +24,7 @@ const missionSchema = new mongoose.Schema(
     // ordered waypoints
     flightPath: [flightPointSchema],
 
-    // top-level pattern 
+    // top-level pattern
     pattern: { type: String, enum: ['grid', 'lawnmower', 'crosshatch', 'perimeter'], default: 'grid' },
 
     status: {
@@ -36,7 +36,6 @@ const missionSchema = new mongoose.Schema(
     parameters: {
       altitude: { type: Number, default: 50 },
       overlap: { type: Number, default: 20 },
-      // Accept both canonical and common alias to avoid create-time validation issues.
       pattern: { type: String, enum: ['grid', 'lawnmower', 'crosshatch', 'perimeter'], default: 'grid' },
       sensors: { type: [String], default: ['camera'] },
       frequency: { type: Number, default: 1 },
@@ -49,8 +48,14 @@ const missionSchema = new mongoose.Schema(
     // Persist simulation state for workers / simulator to resume reliably
     simIndex: { type: Number, default: 0 },
     simProgress: { type: Number, default: 0 },
+
+    // Ownership
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   },
   { timestamps: true }
 );
+
+// Index to speed up owner queries
+missionSchema.index({ createdBy: 1, status: 1 });
 
 export default mongoose.model('Mission', missionSchema);

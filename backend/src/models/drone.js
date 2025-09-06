@@ -9,7 +9,13 @@ const droneSchema = new mongoose.Schema({
   location: {
     lat: { type: Number, default: 0 },
     lng: { type: Number, default: 0 }
-  }
+  },
+
+  // ownership: which user created / owns this drone
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
 }, { timestamps: true });
+
+// Index for faster owner lookups
+droneSchema.index({ createdBy: 1 });
 
 export default mongoose.model('Drone', droneSchema);

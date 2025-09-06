@@ -6,7 +6,13 @@ const reportSchema = new mongoose.Schema({
   duration: { type: Number, required: true }, // Minutes
   distance: { type: Number, required: true }, // Meters
   coverage: { type: Number, required: true }, // Square meters
-  notes: { type: String, default: '' }
+  notes: { type: String, default: '' },
+
+  // Ownership: who created this report (same as mission owner)
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
 }, { timestamps: true });
+
+// Index to speed up owner queries
+reportSchema.index({ createdBy: 1 });
 
 export default mongoose.model('Report', reportSchema);
