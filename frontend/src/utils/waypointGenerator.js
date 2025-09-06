@@ -17,99 +17,89 @@ const metersToDegLon = (meters, lat) => {
 };
 
 /**
- * Helper: remove consecutive duplicates and tiny segments
- */
-function filterAndLabel(points, minSegMeters = 1) {
-  const out = [];
-  for (let i = 0; i < points.length; i++) {
-    const cur = points[i];
-    const prev = out[out.length - 1];
-    if (!prev || prev.lat !== cur.lat || prev.lng !== cur.lng) {
-      // filter out too-short segments if there's a prev
-      if (prev) {
-        const a = turf.point([prev.lng, prev.lat]);
-        const b = turf.point([cur.lng, cur.lat]);
-        const d = turf.distance(a, b, { units: 'meters' });
-        if (d < minSegMeters) {
-          // skip very short hop
-          continue;
-        }
-      }
-      out.push({ ...cur, order: out.length });
-    }
-  }
-  return out;
-}
-
-/**
- * Downsample to a maximum number of points while keeping endpoints.
- */
-function downsamplePoints(points, maxPoints = 1200) {
-  if (!Array.isArray(points) || points.length <= maxPoints) return points;
-  const n = points.length;
-  const step = (n - 1) / (maxPoints - 1);
-  const out = [];
-  for (let i = 0; i < maxPoints; i++) {
-    const idx = Math.round(i * step);
-    out.push(points[Math.min(idx, n - 1)]);
-  }
-  return out.map((p, i) => ({ ...p, order: i }));
-}
-
-/**
  * Generate perimeter waypoints (just polygon vertices).
+ * polygonLatLngs: array of [lat, lng] pairs
  */
 export function generatePerimeter(polygonLatLngs = [], altitude = 30) {
+  if (!Array.isArray(polygonLatLngs)) return [];
   return polygonLatLngs.map((p, idx) => ({
-    lat: p[0],
-    lng: p[1],
+    lat: Number(p[0]),
+    lng: Number(p[1]),
     alt: altitude,
     order: idx,
   }));
 }
 
 /**
- * Safer generateLawnmower that limits lines & filters tiny segments.
- * Accepts optional options { spacingMeters, altitude, maxPoints, minSegMeters }.
+ * Generate lawnmower/crosshatch (sweep) pattern across polygon.
+ *
+ * - polygonLatLngs: array of [lat, lng]
+ * - spacingMeters: desired spacing between adjacent sweep lines (meters)
+ * - altitude: altitude meters
+ * - opts: { maxPoints, minSpacingMeters }
+ *
+ * Strategy:
+ *  - Build turf polygon (GeoJSON) and bounding box.
+ *  - Sweep horizontal lines across bbox with step = metersToDegLat(spacingMeters).
+ *  - For each line, compute intersection points with polygon, pair them and emit end points.
+ *  - If estimated points > maxPoints, increase spacingMeters automatically to limit output size.
+ *  - Finally, defensively downsample the resulting waypoint list if it's still > maxPoints.
  */
 export function generateLawnmower(
   polygonLatLngs = [],
   spacingMeters = 30,
   altitude = 30,
-  options = {}
+  opts = {}
 ) {
-  if (!polygonLatLngs || polygonLatLngs.length < 3) return [];
+  const maxPoints = Number(opts.maxPoints ?? 600); // default to 600 to be safer than 800
+  const minSpacingMeters = Number(opts.minSpacingMeters ?? 5); // never go below this
 
-  const { maxPoints = 1200, minSegMeters = 0.5, maxLines = 2000 } = options;
+  if (!Array.isArray(polygonLatLngs) || polygonLatLngs.length < 3) return [];
 
-  // Convert to GeoJSON polygon: turf expects [ [lng,lat], ... ]
-  const coords = polygonLatLngs.map((p) => [p[1], p[0]]);
-  if (coords[0][0] !== coords[coords.length - 1][0] || coords[0][1] !== coords[coords.length - 1][1]) {
+  // Normalize coords for turf: [lng, lat]
+  const coords = polygonLatLngs.map((p) => [Number(p[1]), Number(p[0])]);
+
+  // close polygon if needed
+  if (
+    coords.length > 0 &&
+    (coords[0][0] !== coords[coords.length - 1][0] ||
+      coords[0][1] !== coords[coords.length - 1][1])
+  ) {
     coords.push(coords[0]);
   }
+
   const polygon = turf.polygon([coords]);
 
-  const bbox = turf.bbox(polygon); // [minX, minY, maxX, maxY] => [minLng, minLat, maxLng, maxLat]
+  // bbox: [minLng, minLat, maxLng, maxLat]
+  const bbox = turf.bbox(polygon);
   const [minLng, minLat, maxLng, maxLat] = bbox;
 
-  // If bbox is tiny, ensure at least one line
-  const midLat = (minLat + maxLat) / 2;
-  const deltaLatDeg = Math.max(0.00001, metersToDegLat(spacingMeters));
+  // clamp spacing
+  spacingMeters = Math.max(minSpacingMeters, spacingMeters || minSpacingMeters);
 
-  // Protect against extremely small spacing causing huge loops:
-  const approxLines = Math.ceil((maxLat - minLat) / deltaLatDeg) + 2;
-  if (approxLines > maxLines) {
-    // bump spacing to limit line count
-    const factor = Math.ceil(approxLines / maxLines);
-    spacingMeters = Math.max(spacingMeters * factor, spacingMeters);
+  // estimate number of sweep lines and points so we can increase spacing if needed
+  const latSpanMeters = (maxLat - minLat) * 111320; // rough meters for latitude span
+  const estLineCount = Math.max(1, Math.ceil(latSpanMeters / spacingMeters));
+  // rough estimate: each line could produce up to 4 points in complex polygons, but typically 2
+  const estPoints = estLineCount * 2;
+
+  if (estPoints > maxPoints) {
+    // increase spacing proportionally to reduce estimated points
+    const factor = estPoints / maxPoints;
+    spacingMeters = Math.max(minSpacingMeters, Math.ceil(spacingMeters * factor));
   }
 
+  // Now compute delta in degrees latitude
+  const deltaLatDeg = metersToDegLat(spacingMeters);
+
   const lines = [];
-  // use a small epsilon to avoid infinite loops
+  // iterate from minLat - small epsilon to maxLat + epsilon to ensure intersections near borders
   for (let lat = minLat - deltaLatDeg; lat <= maxLat + deltaLatDeg; lat += deltaLatDeg) {
-    lines.push(turf.lineString([[minLng - 1, lat], [maxLng + 1, lat]]));
-    // safety guard
-    if (lines.length > maxLines) break;
+    const line = turf.lineString([
+      [minLng - 1, lat],
+      [maxLng + 1, lat],
+    ]);
+    lines.push(line);
   }
 
   const sweepPoints = [];
@@ -117,14 +107,18 @@ export function generateLawnmower(
 
   for (const line of lines) {
     const intersects = turf.lineIntersect(line, polygon);
-    if (!intersects || intersects.features.length === 0) continue;
+    if (!intersects || !intersects.features || intersects.features.length === 0) continue;
 
+    // intersection points are [lng, lat]
     const pts = intersects.features.map((f) => f.geometry.coordinates);
-    pts.sort((a, b) => a[0] - b[0]); // sort by lng
+    // sort by longitude to produce left->right
+    pts.sort((a, b) => a[0] - b[0]);
 
+    // pair sequential points (0-1, 2-3,...)
     for (let i = 0; i + 1 < pts.length; i += 2) {
       const a = pts[i];
       const b = pts[i + 1];
+
       if (!flip) {
         sweepPoints.push({ lat: a[1], lng: a[0], alt: altitude });
         sweepPoints.push({ lat: b[1], lng: b[0], alt: altitude });
@@ -133,19 +127,31 @@ export function generateLawnmower(
         sweepPoints.push({ lat: a[1], lng: a[0], alt: altitude });
       }
     }
+
     flip = !flip;
-    // quick cap: if sweepPoints already exceeds maxPoints*1.2 we stop generating more lines
-    if (sweepPoints.length > maxPoints * 1.2) break;
   }
 
-  // filter duplicates / tiny segments
-  let filtered = filterAndLabel(sweepPoints, minSegMeters);
+  // Remove consecutive duplicates
+  const filtered = [];
+  for (let i = 0; i < sweepPoints.length; i++) {
+    const cur = sweepPoints[i];
+    const prev = filtered[filtered.length - 1];
+    if (!prev || prev.lat !== cur.lat || prev.lng !== cur.lng) {
+      filtered.push({ ...cur, order: filtered.length });
+    }
+  }
 
-  // downsample if still large
+  // Defensive downsample if still too many points
   if (filtered.length > maxPoints) {
-    filtered = downsamplePoints(filtered, maxPoints);
-  } else {
-    filtered = filtered.map((p, i) => ({ ...p, order: i }));
+    // uniform downsample to maxPoints preserving endpoints
+    const n = filtered.length;
+    const step = (n - 1) / (maxPoints - 1);
+    const out = [];
+    for (let i = 0; i < maxPoints; i++) {
+      const idx = Math.round(i * step);
+      out.push({ ...filtered[Math.min(idx, n - 1)], order: i });
+    }
+    return out;
   }
 
   return filtered;
